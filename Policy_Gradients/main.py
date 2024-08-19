@@ -12,7 +12,7 @@ def main(policy_filename):
     action_dim = env.action_space.n
     policy = Policy(state_dim, action_dim)
 
-    num_trajectories = 1000
+    num_trajectories = 512
     num_epochs = 200
     optimizer = torch.optim.Adam(params=policy.parameters())
     # scheduler = ExponentialLR(optimizer, gamma=0.9)
@@ -50,13 +50,17 @@ def run(policy_filename, steps):
     env = gym.make('LunarLander-v2', new_step_api=True, render_mode="human")
     observation = env.reset()
     count = 0
+    sum_reward = 0
     for i in range(steps):
         with torch.no_grad():
             observation, reward, terminated, truncated, info = env.step(policy(torch.tensor(observation)).argmax().item())
+            sum_reward += reward
         
         if terminated or truncated:
             observation = env.reset()
             count += 1
+            print(f"{count}: Sum reward {sum_reward}")
+            sum_reward = 0
             print(f"{count}: ========== Environment reset ==========")
 
 def get_samples():
@@ -80,7 +84,7 @@ if __name__ == '__main__':
     policy_filename = "checkpoints/policy1"
     losses = main(policy_filename)
     print(losses)
-    # run(policy_filename, 3000)
+    # run(policy_filename, 1000)
     # observations, actions, rewards, sum_discounted_rewards = get_samples_parallel()
     # print(observations.shape, actions.shape, rewards.shape, sum_discounted_rewards.shape)
     

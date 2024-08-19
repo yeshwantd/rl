@@ -14,14 +14,21 @@ def get_trajectory(env, policy, discount=0.9, sampling="deterministic"):
         observations.append(observation)
 
         # Get the action from the logits
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+        policy.to(device)
         policy.eval()
+        observation = observation.to(device)
         with torch.no_grad():
             logits = policy(observation.view(1,-1))         
         if sampling == "deterministic":
             action = torch.argmax(logits).item()
         else:
             action = torch.multinomial(F.softmax(logits, dim=1), num_samples=1).item()
-
+        
+        action.to("cpu")
         # Take a step in the environment
         observation, reward, terminated, truncated, info = env.step(action)
 
