@@ -4,16 +4,22 @@ from policy import Policy
 import utils, time
 from torch.optim.lr_scheduler import StepLR, ExponentialLR
 
-def main(policy_filename):
-    env = gym.make('LunarLander-v2', new_step_api=True)
-    
-    # Initialize the policy
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-    policy = Policy(state_dim, action_dim)
-
+def train(policy_filename, policy=None):
+    # Hyperparameters
+    discount_rate = 0.99
+    action_sampling = "probabilistic"
     num_trajectories = 512
     num_epochs = 200
+
+    # Create the environment
+    env = gym.make('LunarLander-v2', new_step_api=True)
+    
+    # Initialize the policy if not passed as a parameter
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    if policy is None:
+        policy = Policy(state_dim, action_dim)
+
     optimizer = torch.optim.Adam(params=policy.parameters())
     # scheduler = ExponentialLR(optimizer, gamma=0.9)
     losses = []
@@ -23,7 +29,7 @@ def main(policy_filename):
         
         # Sample trajectories from current policy
         observations, actions, rewards, sum_discounted_rewards = utils.get_samples_parallel(
-            env, policy, num_samples=num_trajectories
+            env, policy, num_samples=num_trajectories, discount_rate=discount_rate, action_sampling=action_sampling
         )
         t1 = time.time()
 
@@ -36,7 +42,7 @@ def main(policy_filename):
         losses.append(loss)
         # scheduler.step()
         # save checkpoint after every 10 epochs
-        if i % 20 == 0 and i != 0:
+        if i % 10 == 0 and i != 0:
             torch.save(policy.state_dict(), f"{policy_filename}_{i}.pt")
 
     torch.save(policy.state_dict(), f"{policy_filename}.pt")
@@ -81,10 +87,11 @@ def get_trajectory():
     return utils.get_trajectory(env, policy, time_steps=12, discount=0.9)
 
 if __name__ == '__main__':
-    policy_filename = "checkpoints/policy1"
-    losses = main(policy_filename)
-    print(losses)
-    # run(policy_filename, 1000)
+    policy_filename = "checkpoints/policy2"
+    # policy = None
+    # losses = train(policy_filename, policy)
+    # print(losses)
+    run(policy_filename, 3000)
     # observations, actions, rewards, sum_discounted_rewards = get_samples_parallel()
     # print(observations.shape, actions.shape, rewards.shape, sum_discounted_rewards.shape)
     

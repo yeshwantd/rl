@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.preprocessing import normalize
 
 
-def get_trajectory(env, policy, discount=0.9, sampling="deterministic"):
+def get_trajectory(env, policy, discount=0.9, action_sampling="deterministic"):
     observations, actions, rewards, sum_discounted_rewards = [], [], [], [] # State, Action, Reward, Sum of discounted rewards
     terminated, truncated = False, False
     observation = env.reset()
@@ -23,12 +23,11 @@ def get_trajectory(env, policy, discount=0.9, sampling="deterministic"):
         observation = observation.to(device)
         with torch.no_grad():
             logits = policy(observation.view(1,-1))         
-        if sampling == "deterministic":
+        if action_sampling == "deterministic":
             action = torch.argmax(logits).item()
         else:
             action = torch.multinomial(F.softmax(logits, dim=1), num_samples=1).item()
         
-        action.to("cpu")
         # Take a step in the environment
         observation, reward, terminated, truncated, info = env.step(action)
 
@@ -44,17 +43,17 @@ def get_trajectory(env, policy, discount=0.9, sampling="deterministic"):
 
     return torch.vstack(observations), torch.tensor(actions), torch.tensor(rewards), torch.tensor(sum_discounted_rewards)
 
-def get_samples(env, policy, num_samples, discount=0.9):
+def get_samples(env, policy, num_samples, discount_rate=0.9, action_sampling="deterministic"):
     observations, actions, rewards, sum_discounted_rewards = [], [], [], []
     for i in range(num_samples):
-        o, a, r, dr = get_trajectory(env, policy, discount)        
+        o, a, r, dr = get_trajectory(env, policy, discount_rate, action_sampling)        
         observations.append(o)
         actions.append(a)
         rewards.append(r)
         sum_discounted_rewards.append(dr)         
     return torch.vstack(observations), torch.cat(actions), torch.cat(rewards), torch.cat(sum_discounted_rewards)
 
-def get_samples_parallel(env, policy, num_samples, discount=0.9, num_processes=None):
+def get_samples_parallel(env, policy, num_samples, discount_rate=0.9, action_sampling="deterministic", num_processes=None):
     observations, actions, rewards, sum_discounted_rewards = [], [], [], []
     if num_processes is None:
         num_processes = multiprocessing.cpu_count()
@@ -63,7 +62,7 @@ def get_samples_parallel(env, policy, num_samples, discount=0.9, num_processes=N
     with multiprocessing.Pool(processes=num_processes) as pool:
         results = pool.starmap(
             get_samples,
-            [(env, policy, num_samples//num_processes, discount) for _ in range(num_samples)]
+            [(env, policy, num_samples//num_processes, discount_rate, action_sampling) for _ in range(num_samples)]
         )
     for result in results:
         o, a, r, dr = result 
