@@ -31,6 +31,7 @@ def train(policy_filename, policy=None):
         observations, actions, rewards, sum_discounted_rewards = utils.get_samples_parallel(
             env, policy, num_samples=num_trajectories, discount_rate=discount_rate, action_sampling=action_sampling
         )
+        print(observations.shape)
         t1 = time.time()
 
         # Train the policy on the samples obtained
@@ -87,11 +88,11 @@ def get_trajectory():
     return utils.get_trajectory(env, policy, time_steps=12, discount=0.9)
 
 if __name__ == '__main__':
-    policy_filename = "checkpoints/policy2"
-    # policy = None
-    # losses = train(policy_filename, policy)
-    # print(losses)
-    run(policy_filename, 3000)
+    policy_filename = "checkpoints/policy3"
+    policy = None
+    losses = train(policy_filename, policy)
+    print(losses)
+    # run(policy_filename, 3000)
     # observations, actions, rewards, sum_discounted_rewards = get_samples_parallel()
     # print(observations.shape, actions.shape, rewards.shape, sum_discounted_rewards.shape)
     
