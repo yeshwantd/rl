@@ -10,12 +10,14 @@ class Policy(nn.Module):
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, action_dim)
         self.relu = nn.ReLU()
-        # self.softmax = nn.Softmax(dim=1)
-
     def forward(self, state):
         # state has dimensions B X state_dim (which is 8 for lunar lander)
         out = self.relu(self.fc1(state))
         out = self.relu(self.fc2(out))
         out = self.fc3(out)
-        # out = self.softmax(out)
         return out
+    
+    def action(self, state):
+        logits = self.forward(state)
+        action = torch.argmax(logits, dim=1)
+        return action.item()

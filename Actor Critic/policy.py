@@ -1,5 +1,7 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
 
 class Policy(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -20,9 +22,7 @@ class Policy(nn.Module):
         # out = self.softmax(out)
         return out
     
-    def get_action(self, state, deterministic=True):
-        if deterministic:
-            action = self.forward(state).argmax().item()
-        else:
-            action = torch.multinomial(F.softmax(self.forward(state), dim=1), num_samples=1).item()
-        return action
+    def action(self, state):
+        logits = self.forward(state)
+        action = torch.argmax(logits, dim=1)
+        return action.item()

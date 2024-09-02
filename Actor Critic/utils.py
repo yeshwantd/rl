@@ -1,57 +1,90 @@
 import torch, multiprocessing
 import torch.nn.functional as F
+from torch.distributions import Categorical
 import numpy as np
 import time
 # from memory_profiler import profile
 
 from sklearn.preprocessing import normalize
 
+def run_episode(env, policy, num_episodes):
+    episode_rewards = []
+    for _ in range(num_episodes):
+        observation, _ = env.reset()
+        terminated, truncated = False, False
+        episode_reward = 0
+        while not (terminated or truncated):
+            observation = torch.tensor(observation).view(1,-1)
+            with torch.no_grad():
+                action = policy.action(observation)
+            next_observation, reward, terminated, truncated, _ = env.step(action)
+            episode_reward += reward
+            observation = next_observation
+        episode_rewards.append(episode_reward)
+    return episode_rewards
 
-def get_trajectory(env, policy, discount, action_sampling):
-    observations, actions, rewards, sum_discounted_rewards = [], [], [], []
+def get_discounted_rewards(rewards, discount):
+    n = len(rewards)
+    sum_of_discounted_rewards = []
+    discounts = discount ** torch.arange(n)
+    for i in range(n):
+        sum_of_discounted_rewards.append(torch.sum(rewards[i:] * discounts[:n-i]))
+    return torch.tensor(np.array(sum_of_discounted_rewards))
+
+def run_training_episode(env, policy, value, discount):
+    observations, rewards, sum_discounted_rewards, log_probs = [], [], [], []
+    
     terminated, truncated = False, False
-    observation = env.reset()
+    observation, _ = env.reset()
     while not (terminated or truncated): 
-        observation = torch.tensor(observation, dtype=torch.float32).view(1,-1)
-        
-        if torch.cuda.is_available():
-            device = "cuda"
-            policy.to(device)
-            observation = observation.to(device)
-        else:
-            device = "cpu"
-        
-        # Get the action
-        policy.eval()
-        with torch.no_grad():
-            action = policy.get_action(observation, action_sampling)
-        next_observation, reward, terminated, truncated, _ = env.step(action)
+        observation = torch.tensor(observation).view(1,-1)
+
+        # Get the action and the log probs
+        logits = policy(observation)
+        action_probs = F.softmax(logits, dim=1)
+        action_dist = Categorical(action_probs)
+        action = action_dist.sample()
+        log_prob = action_dist.log_prob(action)
+
+        # Perform the action
+        next_observation, reward, terminated, truncated, _ = env.step(action.item())
 
         # Store the results
         observations.append(observation)
-        actions.append(action)
         rewards.append(reward)
+        log_probs.append(log_prob)
         
         observation = next_observation
-        if sum(rewards) < -250:
-            break
-
+        
     observations = torch.vstack(observations)
-    actions = torch.tensor(np.array(actions), dtype=torch.int64)
-    rewards = torch.tensor(np.array(rewards), dtype=torch.float32)
+    rewards = torch.tensor(np.array(rewards))
+    log_probs = torch.cat(log_probs)
     
-    sum_rewards = get_sum_rewards(rewards)
+    
+    # Get discounted rewards 
+    # sum_rewards = get_sum_rewards(rewards)
+    sum_discounted_rewards = get_discounted_rewards(rewards, discount)
 
-    # Get discounted rewards and normalize it to reduce variance
-    # sum_discounted_rewards = get_discounted_rewards(rewards, discount)
-    # sum_discounted_rewards = normalize(np.array(sum_discounted_rewards).reshape(1,-1)).reshape(-1)
+    # Normalize the rewards to reduce variance
+    # sum_discounted_rewards = F.normalize(sum_discounted_rewards, dim=0)
+    sum_discounted_rewards = (sum_discounted_rewards - sum_discounted_rewards.mean())/sum_discounted_rewards.std()
+    
+    # Get the value of the states
+    values = value(observations)
+    values = values.squeeze()
 
-    return observations, actions, rewards, sum_rewards
-
+    # Get the value and policy losses
+    advantage = sum_discounted_rewards - values.detach()
+    value_loss = F.smooth_l1_loss(values, sum_discounted_rewards)
+    policy_loss = -(log_probs * advantage).sum()
+    
+    # return observations, actions, rewards, sum_discounted_rewards, values
+    return value_loss, policy_loss
+    
 def get_samples(env, policy, num_episodes, discount_rate, action_sampling):
     observations, actions, rewards, sum_discounted_rewards = [], [], [], []
     for i in range(num_episodes):
-        o, a, r, dr = get_trajectory(env, policy, discount_rate, action_sampling)        
+        o, a, r, dr = run_training_episode(env, policy, discount_rate, action_sampling)        
         observations.append(o)
         actions.append(a)
         rewards.append(r)
@@ -87,15 +120,6 @@ def get_sum_rewards(rewards):
     out = torch.cumsum(out, dim=0)
     out = torch.flip(out, dims=(0,))
     return out
-
-def get_discounted_rewards(rewards, discount):
-    n = len(rewards)
-    sum_of_discounted_rewards = []
-    rewards = np.array(rewards)
-    discounts = discount ** np.arange(n)
-    for i in range(n):
-        sum_of_discounted_rewards.append(np.sum(rewards[i:] * discounts[:n-i]))
-    return sum_of_discounted_rewards
 
 def train_policy_step(policy, value, optimizer, observations, actions, rewards, gamma, num_samples):
     if torch.cuda.is_available():
@@ -135,31 +159,35 @@ def train_value_step(value, optimizer, observations, sum_discounted_rewards):
     optimizer.step()
     return value, loss.item()
 
-def train(policy, value, optimizer_policy, optimizer_value, env, num_epochs, num_trajectories, discount, action_sampling, 
-          policy_filepath, value_filepath, chekpoint_frequency):
+def train(policy, value, policy_optimizer, value_optimizer, env, num_epochs, discount, policy_filepath, value_filepath, checkpoint_frequency):
     policy_losses, value_losses = [], []
 
     for i in range(num_epochs):
-        t0 = time.time()
 
-        # Sample trajectories from current policy  
-        observations, actions, rewards, sum_discounted_rewards = get_samples_parallel(env, policy, num_trajectories, discount, action_sampling)
-        t1 = time.time()
+        # Sample a single trajectory
+        # observations, actions, rewards, sum_discounted_rewards = get_samples_parallel(env, policy, num_trajectories, discount, action_sampling)
+        value_loss, policy_loss = run_training_episode(env, policy, value, discount)
+
         # Train the Value function
-        value, value_loss = train_value_step(value, optimizer_value, observations, sum_discounted_rewards)
+        # value, value_loss = train_value_step(value, optimizer_value, observations, sum_discounted_rewards)
+        value_optimizer.zero_grad()
+        value_loss.backward()
+        value_optimizer.step()
 
-        # Train the policy on the samples obtained
-        policy, policy_loss = train_policy_step(policy, value, optimizer_policy, observations, actions, rewards, gamma=0.99, num_samples=num_trajectories)
-        t2 = time.time()
+        # Train the Policy
+        # policy, policy_loss = train_policy_step(policy, value, policy_optimizer, observations, actions, rewards, gamma=0.99, num_samples=num_trajectories)
+        policy_optimizer.zero_grad()
+        policy_loss.backward()
+        policy_optimizer.step()
 
-        print(f"{i}: Policy Loss {policy_loss:0.4f}, Value Loss {value_loss:0.4f}, sampling time {t1 - t0:0.4f}, training time {t2 - t1:0.4f}")
-        policy_losses.append(policy_loss)
-        value_losses.append(value_loss)
+        policy_losses.append(policy_loss.item())
+        value_losses.append(value_loss.item())
 
-        if i % chekpoint_frequency == 0 and i != 0:
-            torch.save(policy.state_dict(), f"{policy_filepath}_{i}.pt")
-            torch.save(value.state_dict(), f"{value_filepath}_{i}.pt")
+        if (i+1) % checkpoint_frequency == 0:
+            torch.save(policy.state_dict(), f"{policy_filepath}_{i+1}.pt")
+            torch.save(value.state_dict(), f"{value_filepath}_{i+1}.pt")
+            policy.eval()
+            validation_rewards = run_episode(env, policy, 10)
+            print(f"{i+1}: Average Rewards: {np.mean(validation_rewards)}, Episode Rewards: {validation_rewards}")
 
-    torch.save(policy.state_dict(), f"{policy_filepath}.pt")
-    torch.save(value.state_dict(), f"{value_filepath}.pt")
     return policy_losses, value_losses
