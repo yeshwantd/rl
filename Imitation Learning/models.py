@@ -1,6 +1,7 @@
 # models.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class BasicPolicy(nn.Module):
     """
@@ -21,3 +22,15 @@ class BasicPolicy(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+    def get_action_distribution(self, x: torch.Tensor):
+        logits = self.forward(x)
+        return F.softmax(logits, dim=-1)
+
+    def get_action(self, x: torch.Tensor, deterministic=True):
+        action_distribution = self.get_action_distribution(x)
+        if deterministic:
+            return torch.argmax(action_distribution).item()
+        else:
+            action = torch.multinomial(action_distribution, num_samples=1)
+        return action.item()

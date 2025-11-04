@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import gymnasium as gym
+import matplotlib.pyplot as plt
 
 from models import BasicPolicy # Assuming models.py is in the same directory
 
@@ -24,24 +27,23 @@ class ImitationDataset(Dataset):
     def __init__(self, path: str):
         data = np.load(path, allow_pickle=True)
         episodes = data["episodes"].tolist()  # list of episodes
-        samples = []
+        
+        self.observations = []
+        self.actions = []
+        
         for ep in episodes:
-            for obs, act, rew in ep:
-                # obs is already a numpy array of shape (8,)
-                samples.append((obs.astype(np.float32), int(act)))
-        self.observations = [s[0] for s in samples]
-        self.actions = [s[1] for s in samples]
+            for obs, act in ep:
+                self.observations.append(torch.from_numpy(obs.astype(np.float32)))
+                self.actions.append(torch.tensor(act, dtype=torch.long))
 
     def __len__(self):
         return len(self.observations)
 
     def __getitem__(self, idx):
-        obs = torch.from_numpy(self.observations[idx])
-        act = torch.tensor(self.actions[idx], dtype=torch.long)
-        return obs, act
+        return self.observations[idx], self.actions[idx]
 
 
-def make_dataloader(path: str, batch_size: int, shuffle: bool = True, num_workers: int = 0) -> DataLoader:
+def make_dataloader(dataset_path: str, batch_size: int, shuffle: bool = True, num_workers: int = 0) -> DataLoader:
     """
     Create a DataLoader from an episodes npz file.
 
@@ -54,24 +56,8 @@ def make_dataloader(path: str, batch_size: int, shuffle: bool = True, num_worker
     Returns:
         DataLoader object
     """
-    dataset = ImitationDataset(path)
+    dataset = ImitationDataset(dataset_path)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-
-# Model, loss, optimizer, device
-
-# Create model
-model = BasicPolicy()
-
-# Loss: cross-entropy for 4-way discrete action classification
-loss_fn = nn.CrossEntropyLoss()
-
-# Optimizer: AdamW (tweak lr/weight_decay as needed)
-optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
-
-# Device: use GPU if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
-print(f"[init] device: {device}")
 
 # Training loop
 def train(
@@ -82,7 +68,6 @@ def train(
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     ckpt_dir: str,
-    log_every: int = 100,
 ) -> Dict[str, List[float]]:
     """
     Train a policy network with cross-entropy loss on imitation data.
@@ -95,8 +80,7 @@ def train(
         train_loader:  DataLoader that yields (obs, action) for training.
         test_loader:   DataLoader that yields (obs, action) for evaluation.
         ckpt_dir:      directory to save checkpoints.
-        log_every:     print a minibatch log every N steps (optional).
-
+        
     Returns:
         history: dict with keys:
             - "train_loss": list of per-epoch average train losses
@@ -106,9 +90,14 @@ def train(
 
     device = next(model.parameters()).device  # use model's current device
     history = {"train_loss": [], "test_loss": []}
+    
+    # Track best model
+    best_test_loss = float('inf')
+    best_epoch = 0
 
-    for epoch in range(1, num_epochs + 1):
-        # ---- Training ----
+    for epoch in range(num_epochs):
+        
+        # ================ Training ================
         model.train()
         running_loss = 0.0
         num_batches = 0
@@ -131,19 +120,15 @@ def train(
             running_loss += loss.item()
             num_batches += 1
 
-            # Optional periodic logging
-            if log_every and (step % log_every == 0):
-                avg_so_far = running_loss / num_batches
-                print(f"[epoch {epoch:03d} | step {step:05d}] train loss (avg): {avg_so_far:.4f}")
-
         # Average train loss over all mini-batches
         epoch_train_loss = running_loss / max(1, num_batches)
         history["train_loss"].append(epoch_train_loss)
 
-        # ---- Evaluation ----
+        # ================ Evaluation ================
         model.eval()
         test_running_loss = 0.0
         test_batches = 0
+        
         with torch.no_grad():
             for obs, act in test_loader:
                 obs = obs.to(device, non_blocking=True)
@@ -152,15 +137,18 @@ def train(
                 loss = loss_fn(logits, act)
                 test_running_loss += loss.item()
                 test_batches += 1
-
+                
         epoch_test_loss = test_running_loss / max(1, test_batches)
         history["test_loss"].append(epoch_test_loss)
-
-        print(f"[epoch {epoch:03d}] train_loss: {epoch_train_loss:.4f} | test_loss: {epoch_test_loss:.4f}")
-
-        # ---- Checkpoint every 5 epochs ----
-        if epoch % 5 == 0:
-            ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch:03d}.pt")
+        
+        # Print train and test loss
+        print(f"Epoch {epoch+1}: train_loss: {epoch_train_loss:.4f}, test_loss: {epoch_test_loss:.4f}")
+        
+        #  ================ Save best model  ================
+        if epoch_test_loss < best_test_loss:
+            best_test_loss = epoch_test_loss
+            best_epoch = epoch
+            best_model_path = os.path.join(ckpt_dir, "best_policy.pt")
             torch.save(
                 {
                     "epoch": epoch,
@@ -169,49 +157,144 @@ def train(
                     "train_loss": epoch_train_loss,
                     "test_loss": epoch_test_loss,
                 },
-                ckpt_path,
+                best_model_path,
             )
-            print(f"[ckpt] saved: {ckpt_path}")
-
+    
     return history
 
-# Create DataLoader from saved episodes
-data_path = "./data/train_episodes.npz"
-batch_size = 64  # you can adjust as needed
+def plot_training_curves(history: Dict[str, List[float]], save_path: str = None):
+    """
+    Plot training and test loss curves.
+    
+    Args:
+        history: Dictionary with 'train_loss' and 'test_loss' keys
+        save_path: Optional path to save the plot
+    """
+    import matplotlib.pyplot as plt
+    
+    plt.figure(figsize=(10, 6))
+    epochs = range(1, len(history["train_loss"]) + 1)
+    
+    plt.plot(epochs, history["train_loss"], label="Train Loss", marker="o", linewidth=2)
+    plt.plot(epochs, history["test_loss"], label="Test Loss", marker="s", linewidth=2)
+    
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Average Loss", fontsize=12)
+    plt.title("Imitation Learning: Training vs Test Loss", fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+    plt.show()
 
-train_loader = make_dataloader(data_path, batch_size=batch_size, shuffle=True)
 
-print(f"[init] Loaded dataset from {data_path}, batches of {batch_size}, total samples: {len(train_loader.dataset)}")
+def visualize_policy(model: nn.Module, env_name: str = "LunarLander-v3", 
+                    num_episodes: int = 5, max_steps: int = 1000, device: str = 'cpu'):
+    """
+    Visualize the trained policy in the environment with human rendering.
+    
+    Args:
+        model: Trained policy model
+        env_name: Name of the Gymnasium environment
+        num_episodes: Number of episodes to visualize
+        max_steps: Maximum steps per episode
+        device: Device the model is on
+    """
+    import gymnasium as gym
+        
+    env = gym.make(env_name, render_mode='human', max_episode_steps=max_steps)
+    model.eval()
+    
+    episode_rewards = []
+    episode_lengths = []
+    
+    for episode in range(num_episodes):
+        observation, info = env.reset()
+        done = False
+        episode_reward = 0
+        step_count = 0
+        
+        with torch.no_grad():
+            while not done and step_count < max_steps:
+                # Get action from policy
+                obs_tensor = torch.tensor(observation, dtype=torch.float32).unsqueeze(0).to(device)
+                logits = model(obs_tensor)
+                action = torch.argmax(logits, dim=1).item()
+                
+                # Take action
+                observation, reward, terminated, truncated, info = env.step(action)
+                episode_reward += reward
+                step_count += 1
+                done = terminated or truncated
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(step_count)
+        
+        print(f"Episode {episode + 1} Reward: {episode_reward:.2f} Steps: {step_count}")
+    env.close()
 
-# Create DataLoader for test set
-test_data_path = "./data/test_episodes.npz"
-test_batch_size = 64  # can be same or different from train batch size
+def main():
+    """Main training and evaluation pipeline."""
+    
+    # Configuration
+    TRAIN_DATA_PATH = "./data/training_data.npz"
+    TEST_DATA_PATH = "./data/test_data.npz"
+    CHECKPOINT_DIR = "./checkpoints"
+    PLOT_SAVE_PATH = "./checkpoints/training_curves.png"
+    
+    BATCH_SIZE = 64
+    NUM_EPOCHS = 50
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 1e-2
+    
+    VISUALIZE_POLICY = True
+    NUM_VIS_EPISODES = 3
+    
+    # Device setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[init] Using device: {device}")
+    
+    # Create model
+    model = BasicPolicy()
+    model = model.to(device)
+    
+    # Loss and optimizer
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    
+    # Load data
+    train_loader = make_dataloader(TRAIN_DATA_PATH, batch_size=BATCH_SIZE, shuffle=True)    
+    test_loader = make_dataloader(TEST_DATA_PATH, batch_size=BATCH_SIZE, shuffle=False)
+    
+    # Train the model
+    history = train(
+        model=model,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        num_epochs=NUM_EPOCHS,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        ckpt_dir=CHECKPOINT_DIR,
+    )
+        
+    
+    # Plot training curves
+    plot_training_curves(history, save_path=PLOT_SAVE_PATH)
+    
+    # Load best model for visualization
+    if VISUALIZE_POLICY:        
+        best_model_path = os.path.join(CHECKPOINT_DIR, "best_policy.pt")
+        if os.path.exists(best_model_path):
+            checkpoint = torch.load(best_model_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            print(f"Warning: Best model not found at {best_model_path}")
+        
+        visualize_policy(model, num_episodes=NUM_VIS_EPISODES, device=device)
 
-test_loader = make_dataloader(test_data_path, batch_size=test_batch_size, shuffle=False)
-
-print(f"[init] Loaded test dataset from {test_data_path}, batches of {test_batch_size}, total samples: {len(test_loader.dataset)}")
-
-# Train the model for 20 epochs, saving checkpoints to ./checkpoints
-history = train(
-    model=model,
-    optimizer=optimizer,
-    loss_fn=loss_fn,
-    num_epochs=40,
-    train_loader=train_loader,
-    test_loader=test_loader,
-    ckpt_dir="./checkpoints"
-)
-
-import matplotlib.pyplot as plt
-
-# Plot training vs test loss curves
-plt.figure(figsize=(8, 5))
-plt.plot(history["train_loss"], label="Train Loss", marker="o")
-plt.plot(history["test_loss"], label="Test Loss", marker="s")
-plt.xlabel("Epoch")
-plt.ylabel("Average Loss")
-plt.title("Training vs Test Loss")
-plt.legend()
-plt.grid(True, linestyle="--", alpha=0.6)
-plt.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    main()
