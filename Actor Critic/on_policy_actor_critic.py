@@ -38,7 +38,8 @@ def generate_episodic_data(env, policy, num_episodes, seed=None, eval_mode=False
         episode = []
         while not done:
             action_distribution = policy.get_action_distribution(observation)
-            action, action_prob = torch.argmax(action_distribution).item(), action_distribution.max()
+            action = torch.multinomial(action_distribution, 1).item()
+            action_prob = action_distribution[action]
             next_observation, reward, terminated, truncated, info = env.step(action)
             episode.append((observation, action, reward, next_observation, action_prob))
             observation = next_observation
@@ -131,8 +132,8 @@ def main():
     env = gym.make("LunarLander-v3", max_episode_steps=max_episode_steps)
     actor = BasicPolicy().to(device)
     critic = BasicValue().to(device)
-    actor_optimizer = optim.Adam(actor.parameters(), lr=1e-3)
-    critic_optimizer = optim.Adam(critic.parameters(), lr=1e-3)
+    actor_optimizer = optim.Adam(actor.parameters(), lr=1e-1)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=1e-1)
     
     critic_losses = []
     # Warm start by training the critic network on sum of discounted rewards
