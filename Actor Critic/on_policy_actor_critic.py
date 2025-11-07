@@ -13,7 +13,7 @@ from utils import test_policy, visualize_policy
 
 
 # Generate episodic data for a given policy
-def generate_episodic_data(env, policy, num_episodes, seed=None, eval_mode=False):
+def generate_episodic_data(env, policy, num_episodes, seed=None, eval_mode=False, device='cpu'):
     """
     Generate episodic data for a given policy in an environment.
 
@@ -37,7 +37,8 @@ def generate_episodic_data(env, policy, num_episodes, seed=None, eval_mode=False
         done = False
         episode = []
         while not done:
-            action_distribution = policy.get_action_distribution(observation)
+            obs_tensor = torch.tensor(observation, dtype=torch.float32).to(device)
+            action_distribution = policy.get_action_distribution(obs_tensor)
             action = torch.multinomial(action_distribution, 1).item()
             action_prob = action_distribution[action]
             next_observation, reward, terminated, truncated, info = env.step(action)
@@ -122,23 +123,23 @@ def main():
     
     SHOW_PLOTS = False
     
-    num_epochs = 1000
-    num_critic_warm_start_epochs = 10
-    num_episodes = 100
+    num_epochs = 4000
+    num_critic_warm_start_epochs = 100
+    num_episodes = 10
     gamma = 0.99
     seed = 42
     max_episode_steps = 500
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     env = gym.make("LunarLander-v3", max_episode_steps=max_episode_steps)
     actor = BasicPolicy().to(device)
     critic = BasicValue().to(device)
     actor_optimizer = optim.Adam(actor.parameters(), lr=1e-1)
-    critic_optimizer = optim.Adam(critic.parameters(), lr=1e-1)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=1e-3)
     
     critic_losses = []
     # Warm start by training the critic network on sum of discounted rewards
     for i in range(num_critic_warm_start_epochs):
-        episodes = generate_episodic_data(env, actor, num_episodes, seed=seed, eval_mode=True)
+        episodes = generate_episodic_data(env, actor, num_episodes, seed=seed, eval_mode=True, device=device)
         critic_loss = train_critic(critic, critic_optimizer, episodes, gamma, device)
         critic_losses.append(critic_loss)
         print(f"Warm start epoch: {i}, Critic Loss: {critic_loss}")
@@ -152,7 +153,7 @@ def main():
     actor_losses, critic_losses = [], []
     best_rewards = -np.inf
     for epoch in range(num_epochs):
-        episodes = generate_episodic_data(env, actor, num_episodes, seed=seed)
+        episodes = generate_episodic_data(env, actor, num_episodes, seed=seed, device=device)
         critic_loss = train_critic(critic, critic_optimizer, episodes, gamma, device)
         actor_loss = train_actor(actor, critic, actor_optimizer, episodes, gamma, device)
         actor_losses.append(actor_loss)
