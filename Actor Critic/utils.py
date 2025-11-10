@@ -22,7 +22,7 @@ def compute_rewards_to_go(rewards, gamma):
     return rewards_to_go
 
 
-def test_policy(env, policy, n_episodes=10):
+def test_policy(env, policy, n_episodes=10, device='cpu'):
     """
     Test the policy on the environment.
 
@@ -30,6 +30,7 @@ def test_policy(env, policy, n_episodes=10):
         env (gym.Env): The environment to test the policy on.
         policy (Policy): The policy to test.
         n_episodes (int, optional): The number of episodes to test the policy on. Defaults to 10.
+        device (str): The device to run the policy on.
     """
     episode_rewards = []
     policy.eval()
@@ -39,20 +40,22 @@ def test_policy(env, policy, n_episodes=10):
             observation, info = env.reset()
             episode_reward = 0        
             while not done:
-                action = policy.get_action(torch.tensor(observation))
+                obs_tensor = torch.tensor(observation, dtype=torch.float32).to(device)
+                action = policy.get_action(obs_tensor)
                 observation, reward, terminated, truncated, info = env.step(action)
                 episode_reward += reward
                 done = terminated or truncated
             episode_rewards.append(episode_reward)
     return episode_rewards
 
-def visualize_policy(env, policy, num_episodes=5):
+def visualize_policy(env, policy, num_episodes=5, device='cpu'):
     """
     Visualize the policy on the environment.
 
     Args:
         env (gym.Env): The environment to visualize the policy on.
         policy (Policy): The policy to visualize.
+        device (str): The device to run the policy on.
     """
     policy.eval()
     with torch.no_grad():
@@ -61,7 +64,8 @@ def visualize_policy(env, policy, num_episodes=5):
             observation, info = env.reset()
             total_reward = 0
             while not done:
-                action = policy.get_action(torch.tensor(observation))
+                obs_tensor = torch.tensor(observation, dtype=torch.float32).to(device)
+                action = policy.get_action(obs_tensor)
                 observation, reward, terminated, truncated, info = env.step(action)
                 total_reward += reward
                 env.render()

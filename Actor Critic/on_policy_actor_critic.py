@@ -237,7 +237,7 @@ def main():
         print(f"Epoch: {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss}")
 
         if (epoch + 1) % 10 == 0:
-            avg_rewards = np.mean(test_policy(eval_env, actor))
+            avg_rewards = np.mean(test_policy(eval_env, actor, device=device))
             print(f"Average rewards for policy after {epoch+1} epochs: {avg_rewards}")
             if avg_rewards > best_rewards:
                 os.makedirs("checkpoints", exist_ok=True)
@@ -252,7 +252,7 @@ def main():
     # visualize best policy in a human-rendered single env
     actor.load_state_dict(torch.load("checkpoints/best_policy.pt"))
     human_env = gym.make("LunarLander-v3", render_mode="human")
-    visualize_policy(human_env, actor)
+    visualize_policy(human_env, actor, device=device)
 
 if __name__ == "__main__":
     main()
