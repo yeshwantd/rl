@@ -133,21 +133,22 @@ def train_critic(model, optimizer, episodes, gamma, device):
         float: The average loss over all episodes.
     """
     losses = []
+
     for episode in episodes:
-        loss = 0
-        for i, (observation, action, reward, next_observation, action_prob) in enumerate(episode):
-            observation = torch.tensor(observation, dtype=torch.float32).to(device)
-            next_observation = torch.tensor(next_observation, dtype=torch.float32).to(device)
-            # y_t = r(s_t,a_t) + γ * V(s_{t+1})
-            target = reward + gamma * model(next_observation).detach()
-            prediction = model(observation)
-            loss += F.mse_loss(target, prediction)
-        
-        # Gradient descent on accumulated losses
+        obs = torch.tensor([t[0] for t in episode], dtype=torch.float32).to(device)
+        rewards = torch.tensor([t[2] for t in episode], dtype=torch.float32).to(device)
+        next_obs = torch.tensor([t[3] for t in episode], dtype=torch.float32).to(device)
+
+        # TD target: r + gamma * V(s_{t+1})
+        targets = rewards + gamma * model(next_obs).detach().squeeze(-1)
+        predictions = model(obs).squeeze(-1)
+        loss = F.mse_loss(predictions, targets)
+
+        # Gradient descent
         optimizer.zero_grad()
-        loss = loss / len(episode)
         loss.backward()
         optimizer.step()
+
         losses.append(loss.item())
     return np.mean(losses)
 
@@ -167,21 +168,21 @@ def train_actor(actor, critic, optimizer, episodes, gamma, device):
     """
     losses = []
     for episode in episodes:
-        loss = 0
-        for i, (observation, action, reward, next_observation, _) in enumerate(episode):
-            obs_tensor = torch.tensor(observation, dtype=torch.float32).to(device)
-            next_obs_tensor = torch.tensor(next_observation, dtype=torch.float32).to(device)
-            
-            # Recompute action probability with current policy parameters (fixes computational graph issue)
-            action_distribution = actor.get_action_distribution(obs_tensor)
-            action_prob = action_distribution[action]
-            
-            advantage = reward + gamma * critic(next_obs_tensor) - critic(obs_tensor)
-            loss += -torch.log(action_prob) * advantage
+        obs = torch.tensor([t[0] for t in episode], dtype=torch.float32).to(device)
+        actions = torch.tensor([t[1] for t in episode], dtype=torch.long).to(device)
+        rewards = torch.tensor([t[2] for t in episode], dtype=torch.float32).to(device)
+        next_obs = torch.tensor([t[3] for t in episode], dtype=torch.float32).to(device)
+
+        action_probs = actor.get_action_distribution(obs)
+        chosen_action_probs = action_probs.gather(1, actions.view(-1, 1)).squeeze(1).clamp(min=1e-8)
+
+        with torch.no_grad():
+            advantages = rewards + gamma * critic(next_obs).squeeze(-1) - critic(obs).squeeze(-1)
+        
+        loss = -torch.mean(torch.log(chosen_action_probs) * advantages)
         
         # Gradient descent on accumulated losses over episode
         optimizer.zero_grad()
-        loss = loss / len(episode)
         loss.backward()
         optimizer.step()
         losses.append(loss.item())
