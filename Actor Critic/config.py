@@ -6,3 +6,4 @@ num_episodes = 200
 gamma = 0.99
 seed = 42
 max_episode_steps = 500
+num_envs = 64  # parallel gym envs
