@@ -202,8 +202,8 @@ def main():
 
     actor = BasicPolicy().to(device)
     critic = BasicValue().to(device)
-    actor_optimizer = optim.Adam(actor.parameters(), lr=1e-1)
-    critic_optimizer = optim.Adam(critic.parameters(), lr=1e-3)
+    actor_optimizer = optim.Adam(actor.parameters(), lr=config.actor_lr)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=config.critic_lr)
 
     critic_losses = []
     # warm start critic using parallel rollouts (policy in eval mode)
