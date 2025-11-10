@@ -11,6 +11,7 @@ from gymnasium.vector import AsyncVectorEnv
 
 from models import BasicPolicy, BasicValue
 from utils import test_policy, visualize_policy
+import config
 
 # Factory function to return a function that creates a single environment to be used by AsyncVectorEnv
 def make_env_fn(env_id="LunarLander-v3", max_episode_steps=500, seed_offset=0):
@@ -189,23 +190,15 @@ def train_actor(actor, critic, optimizer, episodes, gamma, device):
 
 # Train the actor and critic models
 def main():
-    SHOW_PLOTS = False
-
-    num_epochs = 4000
-    num_critic_warm_start_epochs = 100
-    num_episodes = 10
-    gamma = 0.99
-    seed = 42
-    max_episode_steps = 500
     device = torch.device("mps" if torch.backends.mps.is_available()
                           else "cuda" if torch.cuda.is_available() else "cpu")
 
     num_envs = 8  # parallel envs for rollouts
     # vectorized env for training data
-    venv = AsyncVectorEnv([make_env_fn("LunarLander-v3", max_episode_steps, seed + i)
+    venv = AsyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i)
                            for i in range(num_envs)])
     # single env for eval/visualization
-    eval_env = gym.make("LunarLander-v3", max_episode_steps=max_episode_steps)
+    eval_env = gym.make("LunarLander-v3", max_episode_steps=config.max_episode_steps)
 
     actor = BasicPolicy().to(device)
     critic = BasicValue().to(device)
@@ -214,24 +207,24 @@ def main():
 
     critic_losses = []
     # warm start critic using parallel rollouts (policy in eval mode)
-    for i in range(num_critic_warm_start_epochs):
-        episodes = generate_episodic_data(venv, actor, num_episodes, seed=seed,
+    for i in range(config.num_critic_warm_start_epochs):
+        episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=config.seed,
                                           eval_mode=True, device=device)
-        critic_loss = train_critic(critic, critic_optimizer, episodes, gamma, device)
+        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device)
         critic_losses.append(critic_loss)
         print(f"Warm start epoch: {i}, Critic Loss: {critic_loss}")
 
-    if SHOW_PLOTS:
+    if config.SHOW_PLOTS:
         plt.plot(critic_losses, label="Critic Loss")
         plt.show()
 
     actor_losses, critic_losses = [], []
     best_rewards = -np.inf
-    for epoch in range(num_epochs):
-        episodes = generate_episodic_data(venv, actor, num_episodes, seed=seed,
+    for epoch in range(config.num_epochs):
+        episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=config.seed,
                                           eval_mode=False, device=device)
-        critic_loss = train_critic(critic, critic_optimizer, episodes, gamma, device)
-        actor_loss = train_actor(actor, critic, actor_optimizer, episodes, gamma, device)
+        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device)
+        actor_loss = train_actor(actor, critic, actor_optimizer, episodes, config.gamma, device)
         actor_losses.append(actor_loss)
         critic_losses.append(critic_loss)
         print(f"Epoch: {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss}")
@@ -244,7 +237,7 @@ def main():
                 torch.save(actor.state_dict(), "checkpoints/best_policy.pt")
                 best_rewards = avg_rewards
 
-    if SHOW_PLOTS:
+    if config.SHOW_PLOTS:
         plt.plot(actor_losses, label="Actor Loss")
         plt.plot(critic_losses, label="Critic Loss")
         plt.legend(); plt.show()
