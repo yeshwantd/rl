@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from matplotlib import pyplot as plt
 import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 
 from models import BasicPolicy, BasicValue
 from utils import test_policy, visualize_policy
@@ -196,8 +196,8 @@ def main():
 
     num_envs = 8  # parallel envs for rollouts
     # vectorized env for training data
-    venv = AsyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i)
-                           for i in range(num_envs)])
+    venv = SyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i) for i in range(num_envs)])   
+    # venv = AsyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i) for i in range(num_envs)])
     # single env for eval/visualization
     eval_env = gym.make("LunarLander-v3", max_episode_steps=config.max_episode_steps)
 
