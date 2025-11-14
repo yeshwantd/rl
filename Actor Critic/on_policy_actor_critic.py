@@ -119,9 +119,9 @@ def generate_episodic_data(venv, policy, num_episodes, seed=None, eval_mode=Fals
     return episodes[:num_episodes]
 
 # Train a critic model
-def train_critic(model, optimizer, episodes, gamma, device, param_reg_coef=0.01):
+def train_critic(model, optimizer, episodes, gamma, device):
     """
-    Train a critic model using the given episodes and optimizer.
+    Train a critic model using the given episodes and optimizer with batched updates.
 
     Args:
         model (nn.Module): The critic model to train.
@@ -129,15 +129,13 @@ def train_critic(model, optimizer, episodes, gamma, device, param_reg_coef=0.01)
         episodes (list): A list of episodes, where each episode is a list of (observation, action, reward, next_observation) tuples.
         gamma (float): The discount factor.
         device: The device to run on.
-        param_reg_coef (float): Coefficient for parameter regularization to prevent large parameter changes.
 
     Returns:
         float: The average loss over all episodes.
     """
-    losses = []
-    
-    # Save old parameters before any updates
-    old_params = {name: param.clone().detach() for name, param in model.named_parameters()}
+    # Accumulate loss across all episodes, then do single update
+    total_loss = 0.0
+    num_transitions = 0
 
     for episode in episodes:
         obs = torch.from_numpy(np.array([t[0] for t in episode], dtype=np.float32)).to(device)
@@ -147,29 +145,24 @@ def train_critic(model, optimizer, episodes, gamma, device, param_reg_coef=0.01)
         # TD target: r + gamma * V(s_{t+1})
         targets = rewards + gamma * model(next_obs).detach().squeeze(-1)
         predictions = model(obs).squeeze(-1)
-        td_loss = F.huber_loss(predictions, targets)
         
-        # Parameter regularization: penalize deviation from old parameters
-        param_reg_loss = 0.0
-        for name, param in model.named_parameters():
-            param_reg_loss += torch.sum((param - old_params[name]) ** 2)
-        
-        # Total loss = TD loss + regularization
-        loss = td_loss + param_reg_coef * param_reg_loss
+        # Accumulate loss (sum, not mean, so we can average across all transitions later)
+        total_loss += F.huber_loss(predictions, targets, reduction='sum')
+        num_transitions += len(episode)
 
-        # Gradient descent with gradient clipping
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+    # Single gradient update for all episodes
+    avg_loss = total_loss / num_transitions
+    optimizer.zero_grad()
+    avg_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
 
-        losses.append(loss.item())
-    return np.mean(losses)
+    return avg_loss.item()
 
 # Train the actor model via policy gradient
 def train_actor(actor, critic, optimizer, episodes, gamma, device, entropy_coef=0.01, grad_clip=1.0):
     """
-    Train the actor model using the given episodes and optimizer with variance reduction techniques.
+    Train the actor model using the given episodes and optimizer with batched updates and variance reduction.
 
     Args:
         actor (nn.Module): The actor model to train.
@@ -182,10 +175,8 @@ def train_actor(actor, critic, optimizer, episodes, gamma, device, entropy_coef=
         grad_clip (float): Maximum gradient norm for gradient clipping.
 
     Returns:
-        float: The average loss over all episodes.
+        float: The total loss value.
     """
-    losses = []
-    
     # Collect all advantages for normalization
     all_advantages = []
     episode_data = []
@@ -207,7 +198,11 @@ def train_actor(actor, critic, optimizer, episodes, gamma, device, entropy_coef=
     adv_mean = all_advantages_cat.mean()
     adv_std = all_advantages_cat.std() + 1e-8
     
-    # Train on normalized advantages
+    # Accumulate loss across all episodes, then do single update
+    total_policy_loss = 0.0
+    total_entropy = 0.0
+    num_transitions = 0
+    
     for i, (obs, actions) in enumerate(episode_data):
         action_probs = actor.get_action_distribution(obs)
         chosen_action_probs = action_probs.gather(1, actions.view(-1, 1)).squeeze(1).clamp(min=1e-8)
@@ -215,24 +210,28 @@ def train_actor(actor, critic, optimizer, episodes, gamma, device, entropy_coef=
         # Normalize advantages
         normalized_advantages = (all_advantages[i] - adv_mean) / adv_std
         
-        # Policy gradient loss
-        policy_loss = -torch.mean(torch.log(chosen_action_probs) * normalized_advantages)
+        # Policy gradient loss (sum across transitions)
+        total_policy_loss += -torch.sum(torch.log(chosen_action_probs) * normalized_advantages)
         
-        # Entropy bonus for exploration (prevents premature convergence)
-        entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-8), dim=1).mean()
+        # Entropy bonus for exploration (sum across transitions)
+        total_entropy += -torch.sum(action_probs * torch.log(action_probs + 1e-8))
         
-        # Total loss = policy loss - entropy bonus
-        loss = policy_loss - entropy_coef * entropy
-        
-        # Gradient descent with gradient clipping
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip)
-        optimizer.step()
-        
-        losses.append(loss.item())
+        num_transitions += len(obs)
     
-    return np.mean(losses)
+    # Average loss across all transitions
+    avg_policy_loss = total_policy_loss / num_transitions
+    avg_entropy = total_entropy / num_transitions
+    
+    # Total loss = policy loss - entropy bonus
+    total_loss = avg_policy_loss - entropy_coef * avg_entropy
+    
+    # Single gradient update for all episodes
+    optimizer.zero_grad()
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip)
+    optimizer.step()
+    
+    return total_loss.item()
 
 
 # Train the actor and critic models
@@ -252,11 +251,14 @@ def main():
     critic_optimizer = optim.Adam(critic.parameters(), lr=config.critic_lr)
 
     critic_losses = []
-    # warm start critic using parallel rollouts (policy in eval mode)
+    # warm start critic using parallel rollouts with diverse trajectories
     for i in range(config.num_critic_warm_start_epochs):
-        episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=config.seed,
+        # Use different seed each warm start epoch for diversity
+        warmup_seed = config.seed + i if config.seed is not None else None
+        # Use eval_mode=True since we're not training the actor (saves memory, no gradients needed)
+        episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=warmup_seed,
                                           eval_mode=True, device=device)
-        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device, config.param_reg_coef)
+        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device)
         critic_losses.append(critic_loss)
         print(f"Warm start epoch: {i}, Critic Loss: {critic_loss}")
 
@@ -272,20 +274,22 @@ def main():
         episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=epoch_seed,
                                           eval_mode=False, device=device)
         
-        # Update critic 10 times for every actor update
-        critic_loss_sum = 0.0
-        for _ in range(10):
-            critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device, config.param_reg_coef)
-            critic_loss_sum += critic_loss
-        critic_loss_avg = critic_loss_sum / 10
+        # Decay entropy coefficient linearly from start to end value
+        if epoch < config.entropy_coef_decay_epochs:
+            entropy_coef = config.entropy_coef_start - (config.entropy_coef_start - config.entropy_coef_end) * (epoch / config.entropy_coef_decay_epochs)
+        else:
+            entropy_coef = config.entropy_coef_end
         
-        # Update actor once
+        # Update critic once with batched update across all episodes
+        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device)
+        
+        # Update actor once with batched update across all episodes
         actor_loss = train_actor(actor, critic, actor_optimizer, episodes, config.gamma, device, 
-                                config.entropy_coef, config.grad_clip)
+                                entropy_coef, config.grad_clip)
         
         actor_losses.append(actor_loss)
-        critic_losses.append(critic_loss_avg)
-        print(f"Epoch: {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss_avg}")
+        critic_losses.append(critic_loss)
+        print(f"Epoch: {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss}, Entropy Coef: {entropy_coef:.4f}")
 
         if (epoch + 1) % 10 == 0:
             avg_rewards = np.mean(test_policy(eval_env, actor, device=device))
