@@ -142,7 +142,7 @@ def train_critic(model, optimizer, episodes, gamma, device):
         # TD target: r + gamma * V(s_{t+1})
         targets = rewards + gamma * model(next_obs).detach().squeeze(-1)
         predictions = model(obs).squeeze(-1)
-        loss = F.mse_loss(predictions, targets)
+        loss = F.huber_loss(predictions, targets)
 
         # Gradient descent
         optimizer.zero_grad()
