@@ -119,7 +119,7 @@ def generate_episodic_data(venv, policy, num_episodes, seed=None, eval_mode=Fals
     return episodes[:num_episodes]
 
 # Train a critic model
-def train_critic(model, optimizer, episodes, gamma, device):
+def train_critic(model, optimizer, episodes, gamma, device, param_reg_coef=0.01):
     """
     Train a critic model using the given episodes and optimizer.
 
@@ -128,21 +128,34 @@ def train_critic(model, optimizer, episodes, gamma, device):
         optimizer (torch.optim.Optimizer): The optimizer to use for training.
         episodes (list): A list of episodes, where each episode is a list of (observation, action, reward, next_observation) tuples.
         gamma (float): The discount factor.
+        device: The device to run on.
+        param_reg_coef (float): Coefficient for parameter regularization to prevent large parameter changes.
 
     Returns:
         float: The average loss over all episodes.
     """
     losses = []
+    
+    # Save old parameters before any updates
+    old_params = {name: param.clone().detach() for name, param in model.named_parameters()}
 
     for episode in episodes:
-        obs = torch.tensor([t[0] for t in episode], dtype=torch.float32).to(device)
-        rewards = torch.tensor([t[2] for t in episode], dtype=torch.float32).to(device)
-        next_obs = torch.tensor([t[3] for t in episode], dtype=torch.float32).to(device)
+        obs = torch.from_numpy(np.array([t[0] for t in episode], dtype=np.float32)).to(device)
+        rewards = torch.from_numpy(np.array([t[2] for t in episode], dtype=np.float32)).to(device)
+        next_obs = torch.from_numpy(np.array([t[3] for t in episode], dtype=np.float32)).to(device)
 
         # TD target: r + gamma * V(s_{t+1})
         targets = rewards + gamma * model(next_obs).detach().squeeze(-1)
         predictions = model(obs).squeeze(-1)
-        loss = F.huber_loss(predictions, targets)
+        td_loss = F.huber_loss(predictions, targets)
+        
+        # Parameter regularization: penalize deviation from old parameters
+        param_reg_loss = 0.0
+        for name, param in model.named_parameters():
+            param_reg_loss += torch.sum((param - old_params[name]) ** 2)
+        
+        # Total loss = TD loss + regularization
+        loss = td_loss + param_reg_coef * param_reg_loss
 
         # Gradient descent
         optimizer.zero_grad()
@@ -168,10 +181,10 @@ def train_actor(actor, critic, optimizer, episodes, gamma, device):
     """
     losses = []
     for episode in episodes:
-        obs = torch.tensor([t[0] for t in episode], dtype=torch.float32).to(device)
-        actions = torch.tensor([t[1] for t in episode], dtype=torch.long).to(device)
-        rewards = torch.tensor([t[2] for t in episode], dtype=torch.float32).to(device)
-        next_obs = torch.tensor([t[3] for t in episode], dtype=torch.float32).to(device)
+        obs = torch.from_numpy(np.array([t[0] for t in episode], dtype=np.float32)).to(device)
+        actions = torch.from_numpy(np.array([t[1] for t in episode], dtype=np.int64)).to(device)
+        rewards = torch.from_numpy(np.array([t[2] for t in episode], dtype=np.float32)).to(device)
+        next_obs = torch.from_numpy(np.array([t[3] for t in episode], dtype=np.float32)).to(device)
 
         action_probs = actor.get_action_distribution(obs)
         chosen_action_probs = action_probs.gather(1, actions.view(-1, 1)).squeeze(1).clamp(min=1e-8)
@@ -195,8 +208,8 @@ def main():
                           else "cuda" if torch.cuda.is_available() else "cpu")
 
     # vectorized env for training data
-    venv = SyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i) for i in range(config.num_envs)])   
-    # venv = AsyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i) for i in range(num_envs)])
+    # venv = SyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i) for i in range(config.num_envs)])   
+    venv = AsyncVectorEnv([make_env_fn("LunarLander-v3", config.max_episode_steps, config.seed + i) for i in range(config.num_envs)])
     # single env for eval/visualization
     eval_env = gym.make("LunarLander-v3", max_episode_steps=config.max_episode_steps)
 
@@ -210,7 +223,7 @@ def main():
     for i in range(config.num_critic_warm_start_epochs):
         episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=config.seed,
                                           eval_mode=True, device=device)
-        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device)
+        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device, config.param_reg_coef)
         critic_losses.append(critic_loss)
         print(f"Warm start epoch: {i}, Critic Loss: {critic_loss}")
 
@@ -223,11 +236,20 @@ def main():
     for epoch in range(config.num_epochs):
         episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=config.seed,
                                           eval_mode=False, device=device)
-        critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device)
+        
+        # Update critic 10 times for every actor update
+        critic_loss_sum = 0.0
+        for _ in range(10):
+            critic_loss = train_critic(critic, critic_optimizer, episodes, config.gamma, device, config.param_reg_coef)
+            critic_loss_sum += critic_loss
+        critic_loss_avg = critic_loss_sum / 10
+        
+        # Update actor once
         actor_loss = train_actor(actor, critic, actor_optimizer, episodes, config.gamma, device)
+        
         actor_losses.append(actor_loss)
-        critic_losses.append(critic_loss)
-        print(f"Epoch: {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss}")
+        critic_losses.append(critic_loss_avg)
+        print(f"Epoch: {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss_avg}")
 
         if (epoch + 1) % 10 == 0:
             avg_rewards = np.mean(test_policy(eval_env, actor, device=device))
