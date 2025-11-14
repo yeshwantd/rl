@@ -157,48 +157,81 @@ def train_critic(model, optimizer, episodes, gamma, device, param_reg_coef=0.01)
         # Total loss = TD loss + regularization
         loss = td_loss + param_reg_coef * param_reg_loss
 
-        # Gradient descent
+        # Gradient descent with gradient clipping
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         losses.append(loss.item())
     return np.mean(losses)
 
 # Train the actor model via policy gradient
-def train_actor(actor, critic, optimizer, episodes, gamma, device):
+def train_actor(actor, critic, optimizer, episodes, gamma, device, entropy_coef=0.01, grad_clip=1.0):
     """
-    Train the actor model using the given episodes and optimizer.
+    Train the actor model using the given episodes and optimizer with variance reduction techniques.
 
     Args:
-        model (nn.Module): The actor model to train.
+        actor (nn.Module): The actor model to train.
+        critic (nn.Module): The critic model for advantage estimation.
         optimizer (torch.optim.Optimizer): The optimizer to use for training.
         episodes (list): A list of episodes, where each episode is a list of (observation, action, reward, next_observation) tuples.
         gamma (float): The discount factor.
+        device: The device to run on.
+        entropy_coef (float): Coefficient for entropy regularization to encourage exploration.
+        grad_clip (float): Maximum gradient norm for gradient clipping.
 
     Returns:
         float: The average loss over all episodes.
     """
     losses = []
+    
+    # Collect all advantages for normalization
+    all_advantages = []
+    episode_data = []
+    
     for episode in episodes:
         obs = torch.from_numpy(np.array([t[0] for t in episode], dtype=np.float32)).to(device)
         actions = torch.from_numpy(np.array([t[1] for t in episode], dtype=np.int64)).to(device)
         rewards = torch.from_numpy(np.array([t[2] for t in episode], dtype=np.float32)).to(device)
         next_obs = torch.from_numpy(np.array([t[3] for t in episode], dtype=np.float32)).to(device)
 
-        action_probs = actor.get_action_distribution(obs)
-        chosen_action_probs = action_probs.gather(1, actions.view(-1, 1)).squeeze(1).clamp(min=1e-8)
-
         with torch.no_grad():
             advantages = rewards + gamma * critic(next_obs).squeeze(-1) - critic(obs).squeeze(-1)
         
-        loss = -torch.mean(torch.log(chosen_action_probs) * advantages)
+        all_advantages.append(advantages)
+        episode_data.append((obs, actions))
+    
+    # Normalize advantages across all episodes for variance reduction
+    all_advantages_cat = torch.cat(all_advantages)
+    adv_mean = all_advantages_cat.mean()
+    adv_std = all_advantages_cat.std() + 1e-8
+    
+    # Train on normalized advantages
+    for i, (obs, actions) in enumerate(episode_data):
+        action_probs = actor.get_action_distribution(obs)
+        chosen_action_probs = action_probs.gather(1, actions.view(-1, 1)).squeeze(1).clamp(min=1e-8)
         
-        # Gradient descent on accumulated losses over episode
+        # Normalize advantages
+        normalized_advantages = (all_advantages[i] - adv_mean) / adv_std
+        
+        # Policy gradient loss
+        policy_loss = -torch.mean(torch.log(chosen_action_probs) * normalized_advantages)
+        
+        # Entropy bonus for exploration (prevents premature convergence)
+        entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-8), dim=1).mean()
+        
+        # Total loss = policy loss - entropy bonus
+        loss = policy_loss - entropy_coef * entropy
+        
+        # Gradient descent with gradient clipping
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(actor.parameters(), grad_clip)
         optimizer.step()
+        
         losses.append(loss.item())
+    
     return np.mean(losses)
 
 
@@ -234,7 +267,9 @@ def main():
     actor_losses, critic_losses = [], []
     best_rewards = -np.inf
     for epoch in range(config.num_epochs):
-        episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=config.seed,
+        # Use different seed each epoch for diverse experiences
+        epoch_seed = config.seed + epoch if config.seed is not None else None
+        episodes = generate_episodic_data(venv, actor, config.num_episodes, seed=epoch_seed,
                                           eval_mode=False, device=device)
         
         # Update critic 10 times for every actor update
@@ -245,7 +280,8 @@ def main():
         critic_loss_avg = critic_loss_sum / 10
         
         # Update actor once
-        actor_loss = train_actor(actor, critic, actor_optimizer, episodes, config.gamma, device)
+        actor_loss = train_actor(actor, critic, actor_optimizer, episodes, config.gamma, device, 
+                                config.entropy_coef, config.grad_clip)
         
         actor_losses.append(actor_loss)
         critic_losses.append(critic_loss_avg)
