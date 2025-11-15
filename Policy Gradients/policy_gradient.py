@@ -1,166 +1,155 @@
 import torch
 import numpy as np
 import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv
 
 # internal imports
 import utils
 from models import BasicPolicy,  BasicPolicyWithLayerNorm
 from landers import ShapedLunarLander
+import configs
 
 # setup device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def get_envs(num_envs, max_episode_steps, seed):
+    def make_env(rank):
+        def thunk():
+            env = gym.make("LunarLander-v3", max_episode_steps=max_episode_steps)
+            env.reset(seed = (seed + rank) if seed else None)
+            return env
+        return thunk
+    envs = AsyncVectorEnv([make_env(i) for i in range(num_envs)])
+    return envs
+
 # ===== TRAIN =====
-def run_single_episode(policy, env, seed=None):
+def collect_data(policy, num_envs, max_episode_steps, seed=None):
+    envs = get_envs(num_envs, max_episode_steps, seed)
+    obs, infos = envs.reset()
+    episodes_completed = np.zeros(num_envs, dtype=bool)
 
-    observation, info = env.reset(seed=seed)
-    terminated_or_truncated = False
-    rewards, log_probs, entropies = [], [], []
+    all_rewards = [[] for _ in range(num_envs)]
+    all_log_probs = [[] for _ in range(num_envs)]
+    all_entropies = [[] for _ in range(num_envs)]
 
-    while not terminated_or_truncated:
+    while not np.all(episodes_completed):
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
 
-        # Get the probability distribution over all actions
-        action_distribution = policy.get_action_distribution(torch.tensor(observation))
+        # Get action probabilities for all envs in batch
+        action_distributions = policy.get_action_distribution(obs_t) # shape (N,A)
 
-        # Compute the entropy
-        entropy = -torch.sum(action_distribution * torch.log(action_distribution))
-        
-        # Pick one action from the distribution based on their probability values
-        action = torch.multinomial(action_distribution, 1).item()
-        
-        # Execute the action and get feedback from environment
-        next_observation, reward, terminated, truncated, info = env.step(action)
-        
-        # Get log probabilities of the action taken
-        log_prob = torch.log(action_distribution[action])
-        
-        # Store rewards, log probabilities and entropies
-        rewards.append(reward)
-        log_probs.append(log_prob)
-        entropies.append(entropy)
-        
-        # Update the observation
-        observation = next_observation
-        
-        # Check if the episode is terminated or truncated
-        terminated_or_truncated = terminated or truncated
-    
-    return log_probs, rewards, entropies
+        # Compute entropy for all envs in batch
+        entropies = -torch.sum(action_distributions * torch.log(action_distributions + 1e-8), dim=1, keepdim=True) # shape (N,1)
 
+        # Sample one action per env
+        actions = torch.multinomial(action_distributions, num_samples=1) # shape (N, 1)
 
+        # Get log probabilities of the actions taken
+        log_probs = torch.log(action_distributions.gather(dim=1, index=actions)) # shape (N, 1)
 
-def train_batch(policy, optimizer, env, gamma, batch_size, seed=None, beta=None):
-    """
-    Train the policy for one batch
+        # Execute the actions
+        next_obs, rewards, terminated, truncated, infos = envs.step(actions.squeeze(1).cpu().numpy())
 
-    Inputs:
-        gamma: discount factor
-        beta: weight for the entropy factor in the loss
-    """
-    # variables
-    all_log_probs = []
-    all_rewards_to_go = []
+        for i in range(num_envs):
+            if not episodes_completed[i]: 
+                all_rewards[i].append(rewards[i])
+                all_log_probs[i].append(log_probs[i])
+                all_entropies[i].append(entropies[i])
 
-    # Collect data for one episode
-    rewards = []
-    log_probs = []
-    
+            if terminated[i] or truncated[i]:
+                episodes_completed[i] = True
+
+        obs = next_obs
+
+    return all_log_probs, all_rewards, all_entropies
+
+def train(policy, optimizer, gamma, beta, seed):
+    rewards_to_go = []
+
     policy.train()
-    for i in range(batch_size):
-        log_probs, rewards, entropies = run_single_episode(policy=policy, env=env, seed=seed+i if seed else None)
-        discounted_rewards_to_go = utils.compute_rewards_to_go(rewards, gamma)
-        all_log_probs.extend(log_probs)
-        all_rewards_to_go.extend(discounted_rewards_to_go)
-
-    # Convert lists to tensors
-    log_probs_tensor = torch.stack(all_log_probs)
-    rewards_to_go_tensor = torch.tensor(all_rewards_to_go, dtype=torch.float32)
-    entropies_tensor = torch.stack(entropies)
+    log_probs, rewards, entropies = collect_data(policy, configs.num_envs, configs.max_episode_steps, seed)
+    for i in range(configs.num_envs):
+        discounted_rewards_to_go = utils.compute_rewards_to_go(rewards[i], gamma)
+        rewards_to_go.extend(discounted_rewards_to_go)
+        
+    # Convert lists to tensors on the correct device
+    log_probs_tensor = torch.stack([log_probs[i][j] for i in range(configs.num_envs) for j in range(len(log_probs[i]))])
+    rewards_to_go_tensor = torch.tensor(rewards_to_go, dtype=torch.float32, device=device).unsqueeze(1)
+    entropies_tensor = torch.stack([entropies[i][j] for i in range(configs.num_envs) for j in range(len(entropies[i]))])    
 
     # Reduce variance
     rewards_to_go_tensor = (rewards_to_go_tensor - rewards_to_go_tensor.mean()) / (rewards_to_go_tensor.std() + 1e-9)
 
     # Compute loss
-    if beta is not None:
-        loss = (1/batch_size)*(-torch.sum(log_probs_tensor * rewards_to_go_tensor) - beta * entropies_tensor.mean())
-    else:
-        loss = (1/batch_size)*(-torch.sum(log_probs_tensor * rewards_to_go_tensor))
+    loss = (1/configs.num_envs) * (-torch.sum(log_probs_tensor * rewards_to_go_tensor)) - beta * entropies_tensor.mean()
 
     # Backpropagate the loss
     optimizer.zero_grad()
     loss.backward()
-    # torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0) # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0) # Gradient clipping
     optimizer.step()
     
     return loss.item()
+
                 
 if  __name__ == "__main__":
     
     demo = True # set to true if you want to visualize the policy
-    plot = False # set to true if you want to plot the losses and avg. test rewards 
-
-    # Set the seed for reproducability
-    set_seed = True
-    seed = 100
-    if set_seed:
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+    plot = True # set to true if you want to plot the losses and avg. test rewards 
     
-    gamma = 0.99
-    beta_start, beta_end = 1e-3, 1e-8
-    # beta_start, beta_end = 0, 0
-    max_episode_steps = 500
-    num_episodes = 4000
-    batch_size = 10
+    if configs.set_seed:
+        np.random.seed(configs.seed)
+        torch.manual_seed(configs.seed)
+        torch.cuda.manual_seed_all(configs.seed)
     
-    # Create Policy
-    policy = BasicPolicy()
-    # policy = BasicPolicyWithLayerNorm()
+    # Create Policy and move to device
+    policy = BasicPolicy().to(device)
+    # policy = BasicPolicyWithLayerNorm().to(device)
+    
+    print(f"Using device: {device}")
     
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9995) 
 
-    env = gym.make("LunarLander-v3", max_episode_steps=max_episode_steps)
+    env = gym.make("LunarLander-v3", max_episode_steps=configs.max_episode_steps) # for testing
     # env = ShapedLunarLander(gym.make("LunarLander-v3", max_episode_steps=max_episode_steps))
-    losses = []
     avg_rewards = []
-    n_batches = num_episodes//batch_size
-    for i in range(n_batches):
-        loss = train_batch(
-            policy=policy, 
-            optimizer=optimizer, 
-            env=env, 
-            gamma=gamma, 
-            batch_size=batch_size, 
-            seed=(seed + i*batch_size) if set_seed else None,
-            beta=beta_start + (beta_end - beta_start)*(i/(n_batches-1))
+    max_avg_test_reward = 0
+
+    training_loss, losses = [], []
+    for epoch in range(configs.num_epochs):
+        loss = train(
+            policy=policy,
+            optimizer=optimizer,
+            gamma=configs.gamma,
+            beta=configs.beta_start - ((configs.beta_start - configs.beta_end)*epoch/configs.num_epochs),
+            seed=configs.seed + epoch if configs.set_seed else None
         )
         scheduler.step()
-        # print(scheduler.get_last_lr())
         losses.append(loss)
-        # print(f"Episode {i+1}: Loss = {loss}")
-
+        
         # Test policy every 100 episodes
-        if (i+1) % (100/batch_size) == 0:
-            rewards = utils.test_policy(env, policy)
+        if (epoch+1) % 100 == 0:
+            rewards = utils.test_policy(env, policy, device=device)
             avg_reward = np.mean(rewards)
-            print(f"Episode {i+1}: Average Reward = {avg_reward}")
+            print(f"Epoch {epoch+1}: Training Loss = {np.mean(losses)}, Average Reward = {avg_reward}")
+            training_loss.append(np.mean(losses))
+            losses = [] # reset losses
             if avg_reward > 200:
-                torch.save(policy.state_dict(), f"checkpoints/policy_{i+1}.pt")
-                avg_rewards.append([(i+1), avg_reward])
-
+                torch.save(policy.state_dict(), f"checkpoints/policy_{epoch+1}.pt")
+                avg_rewards.append([(epoch+1), avg_reward])
+                if avg_reward > max_avg_test_reward:
+                    max_avg_test_reward = avg_reward
+                    torch.save(policy.state_dict(), f"checkpoints/best_policy.pt")
     
     if plot:
-        # Plot the losses
-        utils.plot(losses,  "Episode", "Loss", "Losses")
+        # Plot the losses and average rewards
+        utils.plot(training_loss,  "Episode", "Loss", "Losses")
         utils.plot(avg_rewards, "Episode", "Average Reward", "Average Rewards")
     
     if demo:
         env = gym.make("LunarLander-v3", render_mode="human")
         # Pick the policy with the highest average reward
-        best_episode = max(avg_rewards, key=lambda x: x[1])
-        print(f"Best Episode: {best_episode[0]} with Average Reward: {best_episode[1]}")
-        policy.load_state_dict(torch.load(f"checkpoints/policy_{best_episode[0]}.pt"))
-        utils.visualize_policy(env, policy, 5)
+        policy.load_state_dict(torch.load(f"checkpoints/best_policy.pt", map_location=device))
+        utils.visualize_policy(env, policy, 5, device=device)
     

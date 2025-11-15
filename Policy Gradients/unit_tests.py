@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models import BasicPolicy
 from utils import compute_rewards_to_go, test_policy, visualize_policy
+from policy_gradient import collect_data
 
 class TestUtils(unittest.TestCase):
     """Test utility functions"""
@@ -73,6 +74,20 @@ class TestBasicPolicy(unittest.TestCase):
         action = policy.get_action(x)
         self.assertTrue(action in [0, 1, 2, 3])
         self.assertTrue(isinstance(action, int))
+
+class TestData(unittest.TestCase):
+    """Test data generation"""
+    def test_collect_data(self):
+        """Test data collection"""
+        policy = BasicPolicy()
+        num_envs = 4
+        seed = 47
+        max_episode_steps = 10
+        log_probs, rewards, entropies = collect_data(policy, num_envs, max_episode_steps, seed)
+        self.assertEqual(len(rewards), num_envs)
+        self.assertEqual(len(log_probs), num_envs)
+        self.assertEqual(len(entropies), num_envs)
+        self.assertEqual(len(rewards[0]), max_episode_steps)
 
 
 def run_tests():
