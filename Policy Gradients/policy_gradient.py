@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import gymnasium as gym
+import os
 from gymnasium.vector import AsyncVectorEnv
 
 # internal imports
@@ -136,6 +137,7 @@ if  __name__ == "__main__":
             training_loss.append(np.mean(losses))
             losses = [] # reset losses
             if avg_reward > 200:
+                os.makedirs("checkpoints", exist_ok=True)
                 torch.save(policy.state_dict(), f"checkpoints/policy_{epoch+1}.pt")
                 avg_rewards.append([(epoch+1), avg_reward])
                 if avg_reward > max_avg_test_reward:
