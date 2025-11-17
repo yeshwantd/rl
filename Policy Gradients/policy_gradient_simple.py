@@ -57,7 +57,7 @@ def train():
             log_probs, rewards, entropies = [], [], []
         
             while not done:
-                logits = policy(torch.tensor(obs).float())
+                logits = policy(torch.tensor(obs, device=device).float())
                 dist = Categorical(logits=logits)
                 action = dist.sample()
                 entropy = dist.entropy()
