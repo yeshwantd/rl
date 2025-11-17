@@ -49,7 +49,7 @@ def train():
         np.random.seed(seed)
 
     # Initialize
-    policy = Policy()
+    policy = Policy().to(device)
     env = gym.make("LunarLander-v3")
     optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
     
@@ -64,10 +64,9 @@ def train():
                 rewards = []
                 obs, info = env.reset(seed=seed + epoch * num_episodes_per_epoch + episode)
                 done = False
-                policy = policy.to("cpu") # Move policy to cpu for collecting training data
-            
+                
                 while not done:
-                    logits = policy(torch.tensor(obs, dtype=torch.float32))
+                    logits = policy(torch.tensor(obs, device=device, dtype=torch.float32))
                     action = Categorical(logits=logits).sample().item()
                     next_obs, reward, terminated, truncated, info = env.step(action)
                     observations.append(obs)
@@ -80,37 +79,27 @@ def train():
                 rewards_to_go = compute_rewards_to_go(rewards, gamma=0.99)
                 advantages.append(rewards_to_go)
 
-        # Convert to tensors and move policy and tensors to GPU
-        policy = policy.to(device)
+        # Convert to tensors and move to GPU
         observations = torch.tensor(np.array(observations), device=device, dtype=torch.float32)
         actions = torch.tensor(np.array(actions), device=device, dtype=torch.int64)
         
         # Subtract baseline 
         advantages = torch.cat(advantages, dim=0).to(device)
-        advantages = (advantages - advantages.mean())/(advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean())/(advantages.std(unbiased=False) + 1e-8)
         
-        # Mini batch update
-        batch_size = 512
-        n_steps = observations.size(0)
-        idxs = torch.randperm(n_steps)
-
-        for start in range(0, n_steps, batch_size):
-            end = start + batch_size
-            batch = idxs[start:end]
-
-            logits = policy(observations[batch])
-            act_dist = Categorical(logits=logits)
-            log_prob = act_dist.log_prob(actions[batch])
-            entropy = act_dist.entropy()
+        logits = policy(observations)
+        act_dist = Categorical(logits=logits)
+        log_prob = act_dist.log_prob(actions)
+        entropy = act_dist.entropy()
             
-            # Compute loss taking the mean over all steps instead of all episodes
-            loss = -(log_prob * advantages[batch]).mean() - 0.01 * entropy.mean()
+        # Compute loss taking the mean over all steps instead of all episodes
+        loss = -(log_prob * advantages).mean() - 0.01 * entropy.mean()
 
-            # Update policy
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0)
-            optimizer.step()
+        # Update policy
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=5.0)
+        optimizer.step()
 
         # Test policy after 100 episodes
         if (epoch+1) % test_every == 0:
@@ -142,11 +131,13 @@ def render(policy):
     env = gym.make("LunarLander-v3", render_mode="human")
     obs, info = env.reset()
     done = False
-    while not done:
-        logits = policy(torch.tensor(obs, dtype=torch.float32))
-        action = torch.argmax(logits).item()
-        obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+    policy.eval()
+    with torch.no_grad():
+        while not done:
+            logits = policy(torch.tensor(obs, dtype=torch.float32))
+            action = torch.argmax(logits).item()
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
 if __name__ == "__main__":
     train()
