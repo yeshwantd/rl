@@ -6,6 +6,8 @@ import numpy as np
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # Policy
 class Policy(Module):
     def __init__(self):
@@ -40,7 +42,7 @@ def train():
         np.random.seed(seed)
 
     # Initialize
-    policy = Policy()
+    policy = Policy().to(device)
     env = gym.make("LunarLander-v3")
     optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
     
@@ -79,7 +81,7 @@ def train():
             
         # Subtract baseline 
         multi_episode_rewards_to_go = torch.cat(multi_episode_rewards_to_go)
-        advantages = (multi_episode_rewards_to_go - multi_episode_rewards_to_go.mean())/(multi_episode_rewards_to_go.stcd() + 1e-8)
+        advantages = (multi_episode_rewards_to_go - multi_episode_rewards_to_go.mean())/(multi_episode_rewards_to_go.std() + 1e-8)
         
         # Compute loss
         logp = torch.stack(multi_episode_log_probs)
