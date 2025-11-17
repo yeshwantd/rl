@@ -84,9 +84,11 @@ def train():
         advantages = (multi_episode_rewards_to_go - multi_episode_rewards_to_go.mean())/(multi_episode_rewards_to_go.std() + 1e-8)
         
         # Compute loss
-        logp = torch.stack(multi_episode_log_probs).to(device)
-        ent = torch.stack(multi_episode_entropies).to(device)
+        logp = torch.stack(multi_episode_log_probs)
+        ent = torch.stack(multi_episode_entropies)
+        advantages = advantages.to(device)
         loss = -(logp * advantages).mean() - 0.02 * ent.mean()
+
         # Update policy
         optimizer.zero_grad()
         loss.backward()
