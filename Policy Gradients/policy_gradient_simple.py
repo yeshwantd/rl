@@ -33,8 +33,9 @@ def compute_rewards_to_go(rewards, gamma=0.99):
 # Train
 def train():
     # Variables
-    num_epochs = 2000
-    num_episodes_per_epoch = 64
+    num_epochs = 1000
+    num_episodes_per_epoch = 32
+    test_every = 100 # tests every n epochs
     seed = 42
 
     if seed:
@@ -49,45 +50,42 @@ def train():
     # Train
     for epoch in range(num_epochs):
         policy.train()
-        multi_episode_log_probs, multi_episode_rewards_to_go, multi_episode_entropies = [], [], []
+        observations, actions, rewards, advantages = [], [], [], []
         
-        for episode in range(num_episodes_per_epoch):
-            obs, info = env.reset(seed=seed + epoch * num_episodes_per_epoch + episode)
-            done = False
-            log_probs, rewards, entropies = [], [], []
-        
-            while not done:
-                logits = policy(torch.tensor(obs, device=device).float())
-                dist = Categorical(logits=logits)
-                action = dist.sample()
-                entropy = dist.entropy()
-                log_prob = dist.log_prob(action)
-                # action_distribution = F.softmax(logits, dim=1)
-                # entropy = -torch.sum(action_distribution * torch.log(action_distribution + 1e-8))
-                # action = torch.multinomial(action_distribution, 1) # Sample an action from action distribution
-                # log_prob = torch.log(action_distribution[action]) # Calculate log probability of the action
-                next_obs, reward, terminated, truncated, info = env.step(action.item())
-                log_probs.append(log_prob)
-                rewards.append(reward)
-                entropies.append(entropy)
-                obs = next_obs
-                done = terminated or truncated
+        # Collect data - disable autograd
+        with torch.no_grad():
+            for episode in range(num_episodes_per_epoch):
+                obs, info = env.reset(seed=seed + epoch * num_episodes_per_epoch + episode)
+                done = False
+            
+                while not done:
+                    logits = policy(torch.tensor(obs, device=device, dtype=torch.float32))
+                    action = Categorical(logits=logits).sample().item()
+                    next_obs, reward, terminated, truncated, info = env.step(action)
+                    observations.append(obs)
+                    actions.append(action)
+                    rewards.append(reward)
+                    obs = next_obs
+                    done = terminated or truncated
 
             # Compute rewards to go
-            rewards_to_go = torch.tensor(compute_rewards_to_go(rewards, gamma=0.99), dtype=torch.float32)
-            multi_episode_entropies.extend(entropies)
-            multi_episode_rewards_to_go.append(rewards_to_go)
-            multi_episode_log_probs.extend(log_probs)
+            rewards_to_go = compute_rewards_to_go(rewards, gamma=0.99)
+            advantages.extend(rewards_to_go)
             
-        # Subtract baseline 
-        multi_episode_rewards_to_go = torch.cat(multi_episode_rewards_to_go)
-        advantages = (multi_episode_rewards_to_go - multi_episode_rewards_to_go.mean())/(multi_episode_rewards_to_go.std() + 1e-8)
+        # Convert to tensors and move to GPU
+        observations = torch.tensor(np.array(observations), device=device, dtype=torch.float32)
+        actions = torch.tensor(np.array(actions), device=device, dtype=torch.int64)
+        logits = policy(observations)
+        act_dist = Categorical(logits=logits)
+        log_prob = act_dist.log_prob(actions)
+        entropy = act_dist.entropy()
         
-        # Compute loss
-        logp = torch.stack(multi_episode_log_probs)
-        ent = torch.stack(multi_episode_entropies)
-        advantages = advantages.to(device)
-        loss = -(logp * advantages).mean() - 0.02 * ent.mean()
+        # Subtract baseline 
+        advantages = torch.tensor(advantages, device=device, dtype=torch.float32)
+        advantages = (advantages - advantages.mean())/(advantages.std() + 1e-8)
+        
+        # Compute loss taking the mean over all steps instead of all episodes
+        loss = -(log_prob * advantages).mean() - 0.01 * entropy.mean()
 
         # Update policy
         optimizer.zero_grad()
@@ -96,7 +94,7 @@ def train():
         optimizer.step()
 
         # Test policy after 100 episodes
-        if (epoch+1) % 100 == 0:
+        if (epoch+1) % test_every == 0:
             test_rewards = []   
             policy.eval() 
             with torch.no_grad():      
@@ -105,7 +103,7 @@ def train():
                     done = False
                     episode_reward = 0
                     while not done:
-                        logits = policy(torch.tensor(obs).float())
+                        logits = policy(torch.tensor(obs, device=device, dtype=torch.float32))
                         action = torch.argmax(logits).item()
                         obs, reward, terminated, truncated, info = env.step(action)
                         episode_reward += reward
