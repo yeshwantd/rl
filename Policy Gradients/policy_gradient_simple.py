@@ -83,10 +83,6 @@ def train():
         policy = policy.to(device)
         observations = torch.tensor(np.array(observations), device=device, dtype=torch.float32)
         actions = torch.tensor(np.array(actions), device=device, dtype=torch.int64)
-        logits = policy(observations)
-        act_dist = Categorical(logits=logits)
-        log_prob = act_dist.log_prob(actions)
-        entropy = act_dist.entropy()
         
         # Subtract baseline 
         advantages = torch.cat(advantages, dim=0).to(device)
@@ -94,15 +90,20 @@ def train():
         
         # Mini batch update
         batch_size = 512
-        n_steps = log_prob.size(0)
+        n_steps = observations.size(0)
         idxs = torch.randperm(n_steps)
 
         for start in range(0, n_steps, batch_size):
             end = start + batch_size
             batch = idxs[start:end]
 
+            logits = policy(observations[batch])
+            act_dist = Categorical(logits=logits)
+            log_prob = act_dist.log_prob(actions[batch])
+            entropy = act_dist.entropy()
+            
             # Compute loss taking the mean over all steps instead of all episodes
-            loss = -(log_prob[batch] * advantages[batch]).mean() - 0.01 * entropy[batch].mean()
+            loss = -(log_prob * advantages[batch]).mean() - 0.01 * entropy.mean()
 
             # Update policy
             optimizer.zero_grad(set_to_none=True)
