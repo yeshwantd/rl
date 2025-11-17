@@ -64,6 +64,7 @@ def train():
                 rewards = []
                 obs, info = env.reset(seed=seed + epoch * num_episodes_per_epoch + episode)
                 done = False
+                policy = policy.to("cpu") # Move policy to cpu for collecting training data
             
                 while not done:
                     logits = policy(torch.tensor(obs, dtype=torch.float32))
@@ -79,7 +80,7 @@ def train():
                 rewards_to_go = compute_rewards_to_go(rewards, gamma=0.99)
                 advantages.append(rewards_to_go)
 
-        # Convert to tensors and move to GPU
+        # Convert to tensors and move policy and tensors to GPU
         policy = policy.to(device)
         observations = torch.tensor(np.array(observations), device=device, dtype=torch.float32)
         actions = torch.tensor(np.array(actions), device=device, dtype=torch.int64)
