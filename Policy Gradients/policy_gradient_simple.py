@@ -86,7 +86,10 @@ def train():
         
         # Collect data - disable autograd
         with torch.no_grad():
-            seeds = [seed + epoch * num_envs + i for i in range(num_envs)]
+            if seed:
+                seeds = [seed + epoch * num_envs + i for i in range(num_envs)]
+            else:
+                seeds = None
             obs, info = envs.reset(seed = seeds)
             done = np.zeros(num_envs, dtype=bool)    
             while not np.all(done):
@@ -142,7 +145,7 @@ def train():
                     if test_seed:
                         obs, info = env.reset(seed=test_seed + i)
                     else:
-                        obs, info = env.reset(seed=random.randint(0, 1000000))
+                        obs, info = env.reset(seed=None)
                     done = False
                     episode_reward = 0
                     while not done:
