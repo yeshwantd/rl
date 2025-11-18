@@ -61,8 +61,8 @@ def train():
     num_episodes_per_epoch = 64
     num_envs = 64
     test_every = 100 # tests every n epochs
-    seed = 42
-    test_seed = 55
+    seed = None
+    test_seed = None
     num_test_episodes = 10
     best_reward = 0
 
