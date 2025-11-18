@@ -4,23 +4,13 @@ from torch.nn import functional as F
 from torch.distributions import Categorical
 import numpy as np
 import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 import matplotlib.pyplot as plt
 import random
 import os, time
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Aysnc vector env
-# def make_envs(num_envs, seed):
-#     def make_env(env_seed):
-#         def thunk():
-#             env = gym.make("LunarLander-v3")
-#             env.reset(seed=env_seed)
-#             return env
-#         return thunk
-#     envs = AsyncVectorEnv([make_env(seed + i) for i in range(num_envs)])
-#     return envs
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cpu"
 
 def make_envs(num_envs):
     def make_env():
@@ -28,7 +18,8 @@ def make_envs(num_envs):
             env = gym.make("LunarLander-v3")
             return env
         return thunk
-    envs = AsyncVectorEnv([make_env() for _ in range(num_envs)])
+    # envs = AsyncVectorEnv([make_env() for _ in range(num_envs)])
+    envs = SyncVectorEnv([make_env() for _ in range(num_envs)])
     return envs
 
 # Policy
@@ -65,6 +56,8 @@ def train():
     test_seed = None
     num_test_episodes = 10
     best_reward = 0
+    entropy_coef_start = 0.02
+    entropy_coef_end = 0.001
 
     if seed:
         torch.manual_seed(seed)
@@ -127,7 +120,8 @@ def train():
         entropy = act_dist.entropy()
             
         # Compute loss taking the mean over all steps instead of all episodes
-        loss = -(log_prob * advantages).mean() - 0.01 * entropy.mean()
+        entropy_coef = entropy_coef_start + (entropy_coef_end - entropy_coef_start) * (epoch / num_epochs)
+        loss = -(log_prob * advantages).mean() - entropy_coef * entropy.mean()
 
         # Update policy
         optimizer.zero_grad(set_to_none=True)
