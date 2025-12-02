@@ -296,8 +296,8 @@ def render(policy, num_times):
     env.close()
 
 if __name__ == "__main__":
-    train_flag = True
-    render_flag = False
+    train_flag = False
+    render_flag = True
     if train_flag:
         start_time = time.time()
         train()
@@ -306,4 +306,4 @@ if __name__ == "__main__":
     if render_flag:
         policy = PolicyNetwork()
         policy.load_state_dict(torch.load("checkpoints/ppo_policy.pth"))
-        render(policy, 3)
+        render(policy, 5)

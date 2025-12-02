@@ -244,10 +244,14 @@ def demo(policy, num_times):
 
 
 if __name__ == "__main__":
-    train()
-    actor = ActorNetwork()
-    # Get the directory of the current script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    checkpoint_path = os.path.join(script_dir, "checkpoints", "actor.pth")
-    actor.load_state_dict(torch.load(checkpoint_path))
-    demo(actor, 3)
+    train_flag = False
+    render_flag = True
+    if train_flag:
+        train()
+    elif render_flag:
+        actor = ActorNetwork()
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        checkpoint_path = os.path.join(script_dir, "checkpoints", "actor.pth")
+        actor.load_state_dict(torch.load(checkpoint_path))
+        demo(actor, 5)
