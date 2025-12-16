@@ -14,14 +14,40 @@ import random
 import time
 import os
 import sys
+import pickle
+
+class RunningMeanStd:
+    def __init__(self, shape):
+        self.mean = np.zeros(shape)
+        self.var = np.ones(shape)
+        self.count = 1e-4
+
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        
+        self.mean = self.mean + delta * batch_count / tot_count
+        self.var = M2 / tot_count
+        self.count = tot_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 class PolicyNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, obs_dim, action_dim):
         super(PolicyNetwork, self).__init__()
-        self.fc1 = nn.Linear(8, 256)
+        self.fc1 = nn.Linear(obs_dim, 256)
         self.fc2 = nn.Linear(256, 256)
-        self.mean = nn.Linear(256, 2) # Assumes a unimodal normal distribution for each action dimension
-        self.log_std = nn.Linear(256, 2)
+        self.mean = nn.Linear(256, action_dim) 
+        self.log_std = nn.Linear(256, action_dim)
 
     def forward(self, x):
         x = F.leaky_relu(self.fc1(x))
@@ -47,9 +73,9 @@ class PolicyNetwork(nn.Module):
         return action, log_prob
         
 class QNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, obs_dim, action_dim):
         super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(10, 256)
+        self.fc1 = nn.Linear(obs_dim + action_dim, 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
         
@@ -79,14 +105,15 @@ def train(checkpoint_path):
         random.seed(train_seed)
 
     # Environment configs
-    env_name = "LunarLanderContinuous-v3"
-    max_episode_steps = 500
+    # Environment configs
+    env_name = "Humanoid-v5"
+    max_episode_steps = 1000
     
     # Agent configs
     gamma = 0.99
-    entropy_weight = 0.05
     policy_lr = 3e-4
     q_lr = 3e-4
+    alpha_lr = 3e-4
     
     # Replay buffer configs
     replay_buffer_size = 100000
@@ -94,19 +121,18 @@ def train(checkpoint_path):
     # Target network configs
     tau = 0.005
 
-    # Noise configs
-    noise_mean = 0
-    noise_std = 0.2
-    noise_std_min = 0.05
-    noise_decay_steps = 50000
-    
+
     # Initialize the environment
     env = gym.make(env_name, max_episode_steps=max_episode_steps)
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    
+    obs_normalizer = RunningMeanStd(shape=(obs_dim,))
     
     # Initialize the actor and critic networks
-    policy = PolicyNetwork()
-    q1 = QNetwork()
-    q2 = QNetwork()
+    policy = PolicyNetwork(obs_dim, action_dim)
+    q1 = QNetwork(obs_dim, action_dim)
+    q2 = QNetwork(obs_dim, action_dim)
     
     # Initialize the target networks and set parameters equal to the original networks
     # policy_target = copy.deepcopy(policy)
@@ -117,6 +143,12 @@ def train(checkpoint_path):
     policy_optim = optim.Adam(policy.parameters(), lr=policy_lr)
     q1_optim = optim.Adam(q1.parameters(), lr=q_lr)
     q2_optim = optim.Adam(q2.parameters(), lr=q_lr)
+
+    # Automatic entropy tuning
+    target_entropy = -torch.prod(torch.Tensor(env.action_space.shape).to(torch.device("cpu"))).item()
+    log_alpha = torch.zeros(1, requires_grad=True)
+    alpha_optim = optim.Adam([log_alpha], lr=alpha_lr)
+    alpha = log_alpha.exp()
     
     # Initialize the replay buffer
     replay_buffer = deque(maxlen=replay_buffer_size)
@@ -127,6 +159,7 @@ def train(checkpoint_path):
         for i in range(num_trajectories):
             seed = train_seed + epoch if set_seed and train_seed is not None else None
             obs, info = env.reset(seed=seed)
+            obs = obs_normalizer.normalize(obs)
             done = False
             while not done:
                 # Sample an action from the policy
@@ -134,6 +167,11 @@ def train(checkpoint_path):
                     action, _ = policy.sample(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
                 action = action.squeeze(0).numpy()
                 next_obs, reward, terminated, truncated, info = env.step(action)
+                
+                # Update normalizer with raw next_obs, then normalize it
+                obs_normalizer.update(np.array([next_obs]))
+                next_obs = obs_normalizer.normalize(next_obs)
+                
                 done = terminated or truncated
                 replay_buffer.append((obs, action, reward, next_obs, done))
                 obs = next_obs
@@ -159,7 +197,7 @@ def train(checkpoint_path):
                 q1_next = q1_target(next_state_action)  # q1(s',a') - using target q networks for stability
                 q2_next = q2_target(next_state_action)  # q2(s',a')
                 min_q_next = torch.min(q1_next, q2_next)  # Q(s',a')
-                y = reward + gamma * (1 - done) * (min_q_next - entropy_weight * next_log_prob)
+                y = reward + gamma * (1 - done) * (min_q_next - alpha * next_log_prob)
                 # y = r(s,a) + γ * (Qθ(s',a') - α * log(π(a'|s')))
 
             # Update Q-functions
@@ -181,13 +219,22 @@ def train(checkpoint_path):
             q2_new = q2(torch.cat([obs, new_action], dim=1))  # q2(s',a')
             min_q_new = torch.min(q1_new, q2_new)  # Q(s',a')
             
-            policy_loss = -(min_q_new - entropy_weight * log_prob).mean()  
+            policy_loss = -(min_q_new - alpha * log_prob).mean()    
             # -J(πφ) = E s ~ D, ϵ ~ N [Qθ(s,a) - α * log(πφ(a|s))]
             # where a = fφ(ϵ;s) is the action sampled using the reparameterization trick
 
             policy_optim.zero_grad()
             policy_loss.backward()
             policy_optim.step()
+
+            # Update Alpha
+            alpha_loss = -(log_alpha * (log_prob + target_entropy).detach()).mean()
+
+            alpha_optim.zero_grad()
+            alpha_loss.backward()
+            alpha_optim.step()
+
+            alpha = log_alpha.exp()
 
             # Soft update target networks
             for target_param, param in zip(q1_target.parameters(), q1.parameters()):
@@ -201,6 +248,7 @@ def train(checkpoint_path):
             test_rewards = []
             for i in range(num_test_episodes):
                 obs, info = env.reset(seed = test_seed + i if set_seed and test_seed is not None else None)
+                obs = obs_normalizer.normalize(obs)
                 done = False
                 episode_reward = 0
                 while not done:
@@ -208,11 +256,14 @@ def train(checkpoint_path):
                         action, _ = policy.sample(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
                     action = action.squeeze(0).numpy()
                     obs, reward, terminated, truncated, info = env.step(action)
+                    obs = obs_normalizer.normalize(obs)
                     done = terminated or truncated
                     episode_reward += reward
                 if episode_reward > best_test_reward:
                     best_test_reward = episode_reward
                     torch.save(policy.state_dict(), checkpoint_path)
+                    with open("checkpoints/sac_humanoid_obs_normalizer.pkl", "wb") as f:
+                        pickle.dump(obs_normalizer, f)
                         
 
                 test_rewards.append(episode_reward)
@@ -221,10 +272,12 @@ def train(checkpoint_path):
     env.close()
 
 # Demo the policy
-def demo(policy, num_times):
-    env = gym.make("LunarLanderContinuous-v3", render_mode="human")
+def demo(policy, obs_normalizer, num_times):
+    env = gym.make("Humanoid-v5", render_mode="human")
     for i in range(num_times):    
         obs, info = env.reset()
+        if obs_normalizer is not None:
+            obs = obs_normalizer.normalize(obs)
         done = False
         tot_reward = 0
         policy.eval()
@@ -233,21 +286,34 @@ def demo(policy, num_times):
                 action, _ = policy.sample(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
                 action = action.squeeze(0).numpy()
                 obs, reward, terminated, truncated, info = env.step(action)
+                if obs_normalizer is not None:
+                    obs = obs_normalizer.normalize(obs)
                 tot_reward += reward
                 done = terminated or truncated
             print(f"Total reward for episode {i+1}: {tot_reward}")
 
 if __name__ == "__main__":
-    train_flag = False
-    render_flag = True
-    checkpoint_path = "checkpoints/sac_policy.pth"
+    train_flag = True
+    render_flag = False
+    checkpoint_path = "checkpoints/sac_humanoid_policy.pth"
     if train_flag:
         start_time = time.time()
         train(checkpoint_path)
         end_time = time.time()
         print(f"Total Training Time: {(end_time - start_time)/60:.2f} minutes")
     elif render_flag:
-        policy = PolicyNetwork()
+        env = gym.make("Humanoid-v5", render_mode="human")
+        obs_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
+        env.close()
+        
+        policy = PolicyNetwork(obs_dim, action_dim)
         policy.load_state_dict(torch.load(checkpoint_path))
-        demo(policy, 5)
+        
+        obs_normalizer = None
+        if os.path.exists("checkpoints/sac_humanoid_obs_normalizer.pkl"):
+            with open("checkpoints/sac_humanoid_obs_normalizer.pkl", "rb") as f:
+                obs_normalizer = pickle.load(f)
+                
+        demo(policy, obs_normalizer, 5)
         
