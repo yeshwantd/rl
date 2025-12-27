@@ -71,7 +71,7 @@ def visualize_policy(env, policy, num_episodes=5, device='cpu'):
                 env.render()
                 done = terminated or truncated
             print(f"Episode reward: {total_reward}")
-    env.close()
+    en
 
 
 def plot(x, xlabel, ylabel, title=None):
