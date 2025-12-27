@@ -16,44 +16,68 @@ import os
 import sys
 
 class PolicyNetwork(nn.Module):
+    """
+    Parametrized policy πθ(a|s).
+    Uses a Gaussian distribution for continuous actions.
+    """
     def __init__(self):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(8, 256)
         self.fc2 = nn.Linear(256, 256)
-        self.mean = nn.Linear(256, 2) # Assumes a unimodal normal distribution for each action dimension
-        self.log_std = nn.Linear(256, 2)
+        self.mean = nn.Linear(256, 2) # Mean of the Gaussian
+        self.log_std = nn.Linear(256, 2) # Log-standard deviation of the Gaussian
 
     def forward(self, x):
+        """
+        Computes the mean and log-std of the Gaussian distribution.
+        """
         x = F.leaky_relu(self.fc1(x))
         x = F.leaky_relu(self.fc2(x))
         mean = self.mean(x) 
         log_std = self.log_std(x)
-        log_std = torch.clamp(log_std, min=-20, max=2) # numerical stability to prevent vanishing and exploding variance
+        # Clamp log_std to [min_val, max_val] for numerical stability
+        log_std = torch.clamp(log_std, min=-20, max=2) 
         return mean, log_std
 
     def sample(self, x):
+        """
+        Samples an action using the reparameterization trick and applies tanh squashing.
+        Returns:
+            action: Squashed action in [-1, 1]
+            log_prob: Corrected log-probability of the action
+        """
         mean, log_std = self.forward(x)
         std = log_std.exp()
         normal = Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t) # Enforce action bounds from -1 to 1, but also changes probability distribution
-        action = y_t
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1 - y_t.pow(2) + 1e-6) # Jacobian correction since we changed probability distribution by squishing it using tanh
-        # π(a|s) = µ(u|s) |det da/du|^−1   Change of variables formula
-        # da /du = diag(1−tanh^2(u))
-        # log π(a|s) = log µ(u|s) − sum_i[log(1−tanh^2(u_i))]
+        
+        # Reparameterization trick: u = mean + std * epsilon, where epsilon ~ N(0, 1)
+        u = normal.rsample()  
+        action = torch.tanh(u) # Enforce action bounds from -1 to 1
+
+        # Calculate log probability of the action
+        log_prob = normal.log_prob(u)
+        # Apply Jacobian correction for the tanh transformation
+        # log π(a|s) = log µ(u|s) - sum(log(1 - tanh^2(u)))
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6) 
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
         
 class QNetwork(nn.Module):
+    """
+    Soft Q-function Qφ(s, a).
+    Computes the expected return of taking action 'a' in state 's'.
+    """
     def __init__(self):
         super(QNetwork, self).__init__()
+        # Input: obs_dim (8) + action_dim (2) = 10
         self.fc1 = nn.Linear(10, 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
         
     def forward(self, x):
+        """
+        x is a concatenation of [observation, action]
+        """
         x = F.leaky_relu(self.fc1(x))
         x = F.leaky_relu(self.fc2(x))
         x = self.fc3(x)
@@ -93,12 +117,6 @@ def train(checkpoint_path):
     
     # Target network configs
     tau = 0.005
-
-    # Noise configs
-    noise_mean = 0
-    noise_std = 0.2
-    noise_std_min = 0.05
-    noise_decay_steps = 50000
     
     # Initialize the environment
     env = gym.make(env_name, max_episode_steps=max_episode_steps)
@@ -109,7 +127,6 @@ def train(checkpoint_path):
     q2 = QNetwork()
     
     # Initialize the target networks and set parameters equal to the original networks
-    # policy_target = copy.deepcopy(policy)
     q1_target = copy.deepcopy(q1)
     q2_target = copy.deepcopy(q2)
     
@@ -154,17 +171,23 @@ def train(checkpoint_path):
             
             # Compute targets for Q-functions
             with torch.no_grad():
-                next_action, next_log_prob = policy.sample(next_obs)  # a' = π(s')
+                # Sample next actions and their log-probabilities from current policy
+                next_action, next_log_prob = policy.sample(next_obs)
                 next_state_action = torch.cat([next_obs, next_action], dim=1)
-                q1_next = q1_target(next_state_action)  # q1(s',a') - using target q networks for stability
-                q2_next = q2_target(next_state_action)  # q2(s',a')
-                min_q_next = torch.min(q1_next, q2_next)  # Q(s',a')
+                
+                # Clipped Double-Q trick: use the minimum of two target Q-networks
+                # This reduces overestimation bias in Q-learning.
+                q1_next = q1_target(next_state_action)
+                q2_next = q2_target(next_state_action)
+                min_q_next = torch.min(q1_next, q2_next)
+                
+                # Bellman equation with entropy term:
+                # y = r + γ * (1 - d) * (Q_target(s', a') - α * log_π(a'|s'))
                 y = reward + gamma * (1 - done) * (min_q_next - entropy_weight * next_log_prob)
-                # y = r(s,a) + γ * (Qθ(s',a') - α * log(π(a'|s')))
 
             # Update Q-functions
             state_action = torch.cat([obs, action], dim=1)
-            q1_loss = F.mse_loss(q1(state_action), y)  # J(θ) = E(s,a) ~ D [1/2 * (Qθ(s,a) - y)^2]
+            q1_loss = F.mse_loss(q1(state_action), y)  # J(φ) = E(s,a) ~ D [1/2 * (Qφ(s,a) - y)^2]
             q2_loss = F.mse_loss(q2(state_action), y)
             
             q1_optim.zero_grad()
@@ -176,20 +199,23 @@ def train(checkpoint_path):
             q2_optim.step()
 
             # Update Policy
-            new_action, log_prob = policy.sample(obs)  # a' = π(s')
-            q1_new = q1(torch.cat([obs, new_action], dim=1))  # q1(s',a')
-            q2_new = q2(torch.cat([obs, new_action], dim=1))  # q2(s',a')
-            min_q_new = torch.min(q1_new, q2_new)  # Q(s',a')
+            # Sample current actions using current policy
+            new_action, log_prob = policy.sample(obs)
+            q1_new = q1(torch.cat([obs, new_action], dim=1))
+            q2_new = q2(torch.cat([obs, new_action], dim=1))
+            # Use the minimum of current Q-networks for the policy objective
+            min_q_new = torch.min(q1_new, q2_new)
             
+            # Policy objective: Maximize (Q - α * log_π)
+            # We minimize -J(θ) = -E [Qφ(s, a) - α * log(πθ(a|s))]
             policy_loss = -(min_q_new - entropy_weight * log_prob).mean()  
-            # -J(πφ) = E s ~ D, ϵ ~ N [Qθ(s,a) - α * log(πφ(a|s))]
-            # where a = fφ(ϵ;s) is the action sampled using the reparameterization trick
 
             policy_optim.zero_grad()
             policy_loss.backward()
             policy_optim.step()
 
-            # Soft update target networks
+            # Soft update target networks using Exponential Moving Average (EMA)
+            # Q_target = τ * Q_online + (1 - τ) * Q_target
             for target_param, param in zip(q1_target.parameters(), q1.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
             

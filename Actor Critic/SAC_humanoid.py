@@ -17,12 +17,19 @@ import sys
 import pickle
 
 class RunningMeanStd:
+    """
+    Tracks the running mean and variance of a data stream.
+    Used for observation normalization.
+    """
     def __init__(self, shape):
         self.mean = np.zeros(shape)
         self.var = np.ones(shape)
         self.count = 1e-4
 
     def update(self, x):
+        """
+        Updates the running mean and variance with a new batch of data.
+        """
         batch_mean = np.mean(x, axis=0)
         batch_var = np.var(x, axis=0)
         batch_count = x.shape[0]
@@ -39,9 +46,16 @@ class RunningMeanStd:
         self.count = tot_count
 
     def normalize(self, x):
+        """
+        Normalizes the input using the running mean and standard deviation.
+        """
         return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 class PolicyNetwork(nn.Module):
+    """
+    Parametrized policy πθ(a|s).
+    Uses a Gaussian distribution for continuous actions.
+    """
     def __init__(self, obs_dim, action_dim):
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(obs_dim, 256)
@@ -50,29 +64,45 @@ class PolicyNetwork(nn.Module):
         self.log_std = nn.Linear(256, action_dim)
 
     def forward(self, x):
+        """
+        Computes the mean and log-std of the Gaussian distribution.
+        """
         x = F.leaky_relu(self.fc1(x))
         x = F.leaky_relu(self.fc2(x))
         mean = self.mean(x) 
         log_std = self.log_std(x)
-        log_std = torch.clamp(log_std, min=-20, max=2) # numerical stability to prevent vanishing and exploding variance
+        # Clamp log_std to [min_val, max_val] for numerical stability
+        log_std = torch.clamp(log_std, min=-20, max=2) 
         return mean, log_std
 
     def sample(self, x):
+        """
+        Samples an action using the reparameterization trick and applies tanh squashing.
+        Returns:
+            action: Squashed action in [-1, 1]
+            log_prob: Corrected log-probability of the action
+        """
         mean, log_std = self.forward(x)
         std = log_std.exp()
         normal = Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t) # Enforce action bounds from -1 to 1, but also changes probability distribution
-        action = y_t
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1 - y_t.pow(2) + 1e-6) # Jacobian correction since we changed probability distribution by squishing it using tanh
-        # π(a|s) = µ(u|s) |det da/du|^−1   Change of variables formula
-        # da /du = diag(1−tanh^2(u))
-        # log π(a|s) = log µ(u|s) − sum_i[log(1−tanh^2(u_i))]
+        
+        # Reparameterization trick: u = mean + std * epsilon, where epsilon ~ N(0, 1)
+        u = normal.rsample()  
+        action = torch.tanh(u) # Enforce action bounds from -1 to 1
+
+        # Calculate log probability of the action
+        log_prob = normal.log_prob(u)
+        # Apply Jacobian correction for the tanh transformation
+        # log π(a|s) = log µ(u|s) - sum(log(1 - tanh^2(u)))
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6) 
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
         
 class QNetwork(nn.Module):
+    """
+    Soft Q-function Qφ(s, a).
+    Computes the expected return of taking action 'a' in state 's'.
+    """
     def __init__(self, obs_dim, action_dim):
         super(QNetwork, self).__init__()
         self.fc1 = nn.Linear(obs_dim + action_dim, 256)
@@ -80,6 +110,9 @@ class QNetwork(nn.Module):
         self.fc3 = nn.Linear(256, 1)
         
     def forward(self, x):
+        """
+        x is a concatenation of [observation, action]
+        """
         x = F.leaky_relu(self.fc1(x))
         x = F.leaky_relu(self.fc2(x))
         x = self.fc3(x)
@@ -93,7 +126,7 @@ def train(checkpoint_path):
     batch_size = 256
     num_test_episodes = 10
     num_trajectories = 10
-    best_test_reward = 0
+    best_test_reward = 5000
 
     # Reproducibility
     train_seed = 42
@@ -105,7 +138,6 @@ def train(checkpoint_path):
         random.seed(train_seed)
 
     # Environment configs
-    # Environment configs
     env_name = "Humanoid-v5"
     max_episode_steps = 1000
     
@@ -114,6 +146,7 @@ def train(checkpoint_path):
     policy_lr = 3e-4
     q_lr = 3e-4
     alpha_lr = 3e-4
+    reward_scale = 1.0
     
     # Replay buffer configs
     replay_buffer_size = 100000
@@ -127,6 +160,10 @@ def train(checkpoint_path):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     
+    # Action space bounds for scaling
+    action_low = torch.tensor(env.action_space.low, dtype=torch.float32)
+    action_high = torch.tensor(env.action_space.high, dtype=torch.float32)
+    
     obs_normalizer = RunningMeanStd(shape=(obs_dim,))
     
     # Initialize the actor and critic networks
@@ -135,7 +172,6 @@ def train(checkpoint_path):
     q2 = QNetwork(obs_dim, action_dim)
     
     # Initialize the target networks and set parameters equal to the original networks
-    # policy_target = copy.deepcopy(policy)
     q1_target = copy.deepcopy(q1)
     q2_target = copy.deepcopy(q2)
     
@@ -162,18 +198,23 @@ def train(checkpoint_path):
             obs = obs_normalizer.normalize(obs)
             done = False
             while not done:
-                # Sample an action from the policy
+                # Sample an action from the policy (in [-1, 1] range)
                 with torch.no_grad():
                     action, _ = policy.sample(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
-                action = action.squeeze(0).numpy()
-                next_obs, reward, terminated, truncated, info = env.step(action)
+                action = action.squeeze(0).cpu().numpy()
+                
+                # Scale action to environment bounds: [-1, 1] -> [low, high]
+                env_action = env.action_space.low + (action + 1.0) * 0.5 * (env.action_space.high - env.action_space.low)
+                
+                next_obs, reward, terminated, truncated, info = env.step(env_action)
                 
                 # Update normalizer with raw next_obs, then normalize it
                 obs_normalizer.update(np.array([next_obs]))
                 next_obs = obs_normalizer.normalize(next_obs)
                 
                 done = terminated or truncated
-                replay_buffer.append((obs, action, reward, next_obs, done))
+                # Store unscaled action in replay buffer for consistent network logic
+                replay_buffer.append((obs, action, reward * reward_scale, next_obs, done))
                 obs = next_obs
         
         # Sample a batch of steps from the replay buffer
@@ -181,28 +222,34 @@ def train(checkpoint_path):
             if len(replay_buffer) < batch_size:
                 break
             batch = random.sample(replay_buffer, batch_size)
-            obs, action, reward, next_obs, done = zip(*batch)
+            b_obs, b_action, b_reward, b_next_obs, b_done = zip(*batch)
             
             # Convert to tensors
-            obs = torch.tensor(np.array(obs), dtype=torch.float32)
-            action = torch.tensor(np.array(action), dtype=torch.float32)
-            reward = torch.tensor(np.array(reward), dtype=torch.float32).unsqueeze(1)
-            next_obs = torch.tensor(np.array(next_obs), dtype=torch.float32)
-            done = torch.tensor(np.array(done), dtype=torch.int8).unsqueeze(1)
+            b_obs = torch.tensor(np.array(b_obs), dtype=torch.float32)
+            b_action = torch.tensor(np.array(b_action), dtype=torch.float32)
+            b_reward = torch.tensor(np.array(b_reward), dtype=torch.float32).unsqueeze(1)
+            b_next_obs = torch.tensor(np.array(b_next_obs), dtype=torch.float32)
+            b_done = torch.tensor(np.array(b_done), dtype=torch.int8).unsqueeze(1)
             
             # Compute targets for Q-functions
             with torch.no_grad():
-                next_action, next_log_prob = policy.sample(next_obs)  # a' = π(s')
-                next_state_action = torch.cat([next_obs, next_action], dim=1)
-                q1_next = q1_target(next_state_action)  # q1(s',a') - using target q networks for stability
-                q2_next = q2_target(next_state_action)  # q2(s',a')
-                min_q_next = torch.min(q1_next, q2_next)  # Q(s',a')
-                y = reward + gamma * (1 - done) * (min_q_next - alpha * next_log_prob)
-                # y = r(s,a) + γ * (Qθ(s',a') - α * log(π(a'|s')))
+                # Sample next actions and their log-probabilities from current policy
+                next_action, next_log_prob = policy.sample(b_next_obs)
+                next_state_action = torch.cat([b_next_obs, next_action], dim=1)
+                
+                # Clipped Double-Q trick: use the minimum of two target Q-networks
+                # This reduces overestimation bias in Q-learning.
+                q1_next = q1_target(next_state_action)
+                q2_next = q2_target(next_state_action)
+                min_q_next = torch.min(q1_next, q2_next)
+                
+                # Bellman equation with entropy term:
+                # y = r + γ * (1 - d) * (Q_target(s', a') - α * log_π(a'|s'))
+                y = b_reward + gamma * (1 - b_done) * (min_q_next - alpha * next_log_prob)
 
             # Update Q-functions
-            state_action = torch.cat([obs, action], dim=1)
-            q1_loss = F.mse_loss(q1(state_action), y)  # J(θ) = E(s,a) ~ D [1/2 * (Qθ(s,a) - y)^2]
+            state_action = torch.cat([b_obs, b_action], dim=1)
+            q1_loss = F.mse_loss(q1(state_action), y)  # J(φ) = E [1/2 * (Qφ(s,a) - y)^2]
             q2_loss = F.mse_loss(q2(state_action), y)
             
             q1_optim.zero_grad()
@@ -214,35 +261,35 @@ def train(checkpoint_path):
             q2_optim.step()
 
             # Update Policy
-            new_action, log_prob = policy.sample(obs)  # a' = π(s')
-            q1_new = q1(torch.cat([obs, new_action], dim=1))  # q1(s',a')
-            q2_new = q2(torch.cat([obs, new_action], dim=1))  # q2(s',a')
-            min_q_new = torch.min(q1_new, q2_new)  # Q(s',a')
+            # Sample current actions using current policy
+            new_action, log_prob = policy.sample(b_obs)
+            q1_new = q1(torch.cat([b_obs, new_action], dim=1))
+            q2_new = q2(torch.cat([b_obs, new_action], dim=1))
+            # Use the minimum of current Q-networks for the policy objective
+            min_q_new = torch.min(q1_new, q2_new)
             
-            policy_loss = -(min_q_new - alpha * log_prob).mean()    
-            # -J(πφ) = E s ~ D, ϵ ~ N [Qθ(s,a) - α * log(πφ(a|s))]
-            # where a = fφ(ϵ;s) is the action sampled using the reparameterization trick
-
+            # Policy objective: Maximize (Q - α * log_π)
+            # We minimize -J(θ) = -E [Qφ(s, a) - α * log(πθ(a|s))]
+            policy_loss = -(min_q_new - alpha * log_prob).mean()
+            
             policy_optim.zero_grad()
             policy_loss.backward()
             policy_optim.step()
 
-            # Update Alpha
+            # Update Alpha (entropy weight)
             alpha_loss = -(log_alpha * (log_prob + target_entropy).detach()).mean()
-
             alpha_optim.zero_grad()
             alpha_loss.backward()
             alpha_optim.step()
-
             alpha = log_alpha.exp()
 
-            # Soft update target networks
+            # Soft update target networks using Exponential Moving Average (EMA)
+            # Q_target = τ * Q_online + (1 - τ) * Q_target
             for target_param, param in zip(q1_target.parameters(), q1.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
-            
             for target_param, param in zip(q2_target.parameters(), q2.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
-
+        
         # Test the policy
         if (epoch + 1) % test_epochs_freq == 0:
             test_rewards = []
@@ -254,8 +301,12 @@ def train(checkpoint_path):
                 while not done:
                     with torch.no_grad():
                         action, _ = policy.sample(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
-                    action = action.squeeze(0).numpy()
-                    obs, reward, terminated, truncated, info = env.step(action)
+                    action = action.squeeze(0).cpu().numpy()
+                    
+                    # Scale action to environment bounds: [-1, 1] -> [low, high]
+                    env_action = env.action_space.low + (action + 1.0) * 0.5 * (env.action_space.high - env.action_space.low)
+                    
+                    obs, reward, terminated, truncated, info = env.step(env_action)
                     obs = obs_normalizer.normalize(obs)
                     done = terminated or truncated
                     episode_reward += reward
@@ -264,8 +315,6 @@ def train(checkpoint_path):
                     torch.save(policy.state_dict(), checkpoint_path)
                     with open("checkpoints/sac_humanoid_obs_normalizer.pkl", "wb") as f:
                         pickle.dump(obs_normalizer, f)
-                        
-
                 test_rewards.append(episode_reward)
             print(f"Epoch {epoch+1}, Avg Test Reward: {np.mean(test_rewards)}")
 
@@ -284,17 +333,22 @@ def demo(policy, obs_normalizer, num_times):
         with torch.no_grad():
             while not done:
                 action, _ = policy.sample(torch.tensor(obs, dtype=torch.float32).unsqueeze(0))
-                action = action.squeeze(0).numpy()
-                obs, reward, terminated, truncated, info = env.step(action)
+                action = action.squeeze(0).cpu().numpy()
+                
+                # Scale action to environment bounds: [-1, 1] -> [low, high]
+                env_action = env.action_space.low + (action + 1.0) * 0.5 * (env.action_space.high - env.action_space.low)
+                
+                obs, reward, terminated, truncated, info = env.step(env_action)
                 if obs_normalizer is not None:
                     obs = obs_normalizer.normalize(obs)
                 tot_reward += reward
                 done = terminated or truncated
             print(f"Total reward for episode {i+1}: {tot_reward}")
+    env.close()
 
 if __name__ == "__main__":
-    train_flag = True
-    render_flag = False
+    train_flag = False  
+    render_flag = True
     checkpoint_path = "checkpoints/sac_humanoid_policy.pth"
     if train_flag:
         start_time = time.time()
@@ -316,4 +370,3 @@ if __name__ == "__main__":
                 obs_normalizer = pickle.load(f)
                 
         demo(policy, obs_normalizer, 5)
-        
