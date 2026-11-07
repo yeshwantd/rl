@@ -1,1 +1,1 @@
-# Reinforncement Learning
+# Reinforcement Learning
